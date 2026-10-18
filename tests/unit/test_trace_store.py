@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 import weakref
+from itertools import count
 from pathlib import Path
 
 import pytest
@@ -493,7 +494,9 @@ def test_oversized_queue_records_are_rejected(persisted):
     assert persisted._pending_bytes == 0
 
 
-def test_orphan_cleanup_preserves_live_and_pending_traces(persisted, capture, monkeypatch):
+def test_orphan_cleanup_preserves_live_and_pending_traces(
+    persisted, capture, monkeypatch
+):
     """Recover dropped completion frames without retaining dead trace objects.
 
     Args:
@@ -537,7 +540,8 @@ def test_orphan_cleanup_preserves_live_and_pending_traces(persisted, capture, mo
         with sqlite3.connect(persisted.path) as connection:
             persisted._interrupt_inactive(connection)
             assert connection.execute(
-                "SELECT trace_id FROM protected_traces WHERE trace_id=?", (lost.trace_id,)
+                "SELECT trace_id FROM protected_traces WHERE trace_id=?",
+                (lost.trace_id,),
             ).fetchone()
         assert persisted.get_trace(live.trace_id)["trace"]["state"] == "running"
         release.set()
@@ -559,14 +563,49 @@ def test_orphan_cleanup_preserves_live_and_pending_traces(persisted, capture, mo
     assert persisted._pending_bytes == 0
 
 
-@pytest.mark.parametrize("same_timestamp", [False, True])
+@pytest.mark.parametrize(
+    ("clock_step", "reverse", "same_timestamp"),
+    [
+        (None, False, False),
+        (None, True, False),
+        (0, False, False),
+        (0, True, False),
+        (-1, False, False),
+        (-1, True, False),
+        (None, True, True),
+    ],
+    ids=[
+        "real-ordered",
+        "real-reversed",
+        "frozen-ordered",
+        "frozen-reversed",
+        "backward-ordered",
+        "backward-reversed",
+        "same-timestamp-reversed",
+    ],
+)
 def test_stale_updates_do_not_reopen_completed_trace(
-    persisted, capture, same_timestamp
+    persisted, capture, monkeypatch, clock_step, reverse, same_timestamp
 ):
+    """Keep completed snapshots newer even when the wall clock repeats or regresses.
+
+    Args:
+        persisted: Isolated trace database.
+        capture: Immutable trace snapshots.
+        monkeypatch: Pytest patch manager.
+        clock_step: Nanoseconds per clock read, or None for the real clock.
+        reverse: Whether to enqueue snapshots in reverse order.
+        same_timestamp: Whether stored snapshots share a wall-clock timestamp.
+    """
+    if clock_step is not None:
+        clock = count(time.time_ns(), clock_step)
+        monkeypatch.setattr(time, "time_ns", clock.__next__)
     trace = TraceSpan("message", message_outline="Literal % _")
     trace.record("event_received")
     trace.record("pipeline_end", status="success")
-    for frame in reversed(capture):
+    stamps = [int(frame["time_unix_nano"]) for frame in capture]
+    assert all(earlier < later for earlier, later in zip(stamps, stamps[1:]))
+    for frame in reversed(capture) if reverse else capture:
         # Wall-clock timestamps can collide on Windows even for distinct updates.
         if same_timestamp:
             frame["time_unix_nano"] = capture[-1]["time_unix_nano"]
@@ -723,7 +762,10 @@ def test_trace_usage_and_cleanup_preserve_running_traces(
         running.record("event_received")
         for frame in capture:
             assert store.append(
-                frame, owner=running if frame["trace"]["trace_id"] == running.trace_id else finished
+                frame,
+                owner=running
+                if frame["trace"]["trace_id"] == running.trace_id
+                else finished,
             )
         assert store.flush()
         log = tmp_path / "logs" / "astrbot.log"
