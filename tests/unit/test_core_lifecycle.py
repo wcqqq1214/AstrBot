@@ -9,6 +9,7 @@ import pytest
 
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
 from astrbot.core.log import LogBroker
+from astrbot.core.utils.trace_store import close_trace_store
 
 
 @pytest.fixture
@@ -856,10 +857,16 @@ class TestAstrBotCoreLifecycleRestart:
 
         lifecycle.astrbot_updater = MagicMock()
 
-        # Replace only this module's reference; patching threading.Thread also
-        # disables the executor worker used by asyncio.to_thread during shutdown.
-        with patch("astrbot.core.core_lifecycle.threading") as mock_threading:
+        # Patch only this module's threading reference and observe trace shutdown.
+        with (
+            patch("astrbot.core.core_lifecycle.threading") as mock_threading,
+            patch(
+                "astrbot.core.core_lifecycle.asyncio.to_thread", new_callable=AsyncMock
+            ) as mock_to_thread,
+        ):
             await asyncio.wait_for(lifecycle.restart(), timeout=5)
+
+            mock_to_thread.assert_awaited_once_with(close_trace_store)
 
             # Verify managers were terminated
             lifecycle.provider_manager.terminate.assert_awaited_once()
