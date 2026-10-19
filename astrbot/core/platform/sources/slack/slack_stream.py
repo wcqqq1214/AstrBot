@@ -96,6 +96,9 @@ class SlackMessageStream:
         self.sent = ""
         self.open = False
         self.last_update = 0.0
+        self.lock = asyncio.Lock()
+        self.task = asyncio.current_task()
+        self.error: Exception | None = None
 
     async def _flush(self, final: bool = False) -> None:
         """Publish accumulated text, sealing it at a content boundary.
@@ -103,6 +106,8 @@ class SlackMessageStream:
         Args:
             final: Close this segment even if its last update was recent.
         """
+        if self.error is not None:
+            raise self.error
         if not self.text.strip():
             if final:
                 self.text = ""
@@ -258,7 +263,8 @@ class SlackMessageStream:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    await self._flush()
+                    async with self.lock:
+                        await self._flush()
                     continue
                 if producer in done:
                     producer.result()
@@ -266,40 +272,42 @@ class SlackMessageStream:
                 chain = pending.result()
                 pending = None
                 try:
-                    if chain.type in {"break", "aborted"}:
-                        await self._flush(final=True)
-                        if chain.type == "aborted":
-                            break
-                        continue
-                    if chain.type in {"audio_chunk", "tool_call", "agent_stats"}:
-                        continue
-                    # Upstream only emits reasoning when the user enables it. Keep
-                    # it separate from the answer without altering either Markdown.
-                    if chain.chain and (chain.type == "reasoning") != reasoning:
-                        await self._flush(final=True)
-                        reasoning = chain.type == "reasoning"
-                    for component in chain.chain:
-                        if isinstance(component, Reply):
-                            continue
-                        if isinstance(component, (Plain, At)):
-                            text = (
-                                component.text
-                                if isinstance(component, Plain)
-                                else f"<@{component.qq}>"
-                            )
-                            parts = split_slack_markdown(self.text + text)
-                            for part in parts[:-1]:
-                                self.text = part
-                                await self._flush(final=True)
-                            self.text = parts[-1]
-                            await self._flush()
-                        else:
+                    async with self.lock:
+                        if chain.type in {"break", "aborted"}:
                             await self._flush(final=True)
-                            await self.event.send(chain.derive([component]))
+                            if chain.type == "aborted":
+                                break
+                            continue
+                        if chain.type in {"audio_chunk", "tool_call", "agent_stats"}:
+                            continue
+                        # Upstream only emits reasoning when the user enables it. Keep
+                        # it separate from the answer without altering either Markdown.
+                        if chain.chain and (chain.type == "reasoning") != reasoning:
+                            await self._flush(final=True)
+                            reasoning = chain.type == "reasoning"
+                        for component in chain.chain:
+                            if isinstance(component, Reply):
+                                continue
+                            if isinstance(component, (Plain, At)):
+                                text = (
+                                    component.text
+                                    if isinstance(component, Plain)
+                                    else f"<@{component.qq}>"
+                                )
+                                parts = split_slack_markdown(self.text + text)
+                                for part in parts[:-1]:
+                                    self.text = part
+                                    await self._flush(final=True)
+                                self.text = parts[-1]
+                                await self._flush()
+                            else:
+                                await self._flush(final=True)
+                                await self.event.send(chain.derive([component]))
                 finally:
                     if chain.type != "aborted":
                         consumed.set()
-            await self._flush(final=True)
+            async with self.lock:
+                await self._flush(final=True)
         finally:
             producer.cancel()
             if pending is not None:

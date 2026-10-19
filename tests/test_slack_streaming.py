@@ -347,6 +347,7 @@ async def test_stream_closes_on_early_termination(stream, ending):
             asyncio.CancelledError if ending == "cancel" else RuntimeError
         ):
             await stream.event.send_streaming(chunks())
+    assert stream.event._stream is None
     methods = [c.args[0] for c in stream.api.await_args_list]
     assert methods == (
         ["chat.startStream", "chat.stopStream"]
@@ -593,7 +594,12 @@ async def test_sdk_disconnect_does_not_replay_delivered_text(
 
 
 @pytest.mark.asyncio
-async def test_tool_direct_image_through_agent_and_respond_preserves_order(stream):
+@pytest.mark.parametrize(
+    "direct_send", [False, True], ids=["yield-result", "event-send"]
+)
+async def test_tool_direct_image_through_agent_and_respond_preserves_order(
+    stream, direct_send
+):
     messages = []
     closed = set()
 
@@ -602,7 +608,9 @@ async def test_tool_direct_image_through_agent_and_respond_preserves_order(strea
         if method in {"chat.postMessage", "chat.startStream"}:
             if "blocks" in body:
                 # Pending text must be committed before the direct image send.
-                assert messages == ["- 准备。\n  - 子项。"]
+                assert messages == ["- 准备。\n  - 子项。"] or (
+                    direct_send and messages == ["- 准备。\n  - 子项。", "[image]"]
+                )
                 if stream.native:
                     assert closed == {"1"}
                 assert body["blocks"][0]["type"] == "image"
@@ -643,7 +651,13 @@ async def test_tool_direct_image_through_agent_and_respond_preserves_order(strea
                 ),
                 ("streaming_delta", MessageChain([Plain("完成。")])),
             ]:
-                yield AgentResponse(type=kind, data={"chain": chain})
+                if direct_send and kind == "tool_call_result":
+                    # Real plugins may send inside the tool instead of yielding a result.
+                    chain.type = None
+                    await stream.event.send(chain)
+                    await stream.event.send(chain)
+                else:
+                    yield AgentResponse(type=kind, data={"chain": chain})
 
     stream.event.set_result(
         MessageEventResult(
@@ -656,4 +670,94 @@ async def test_tool_direct_image_through_agent_and_respond_preserves_order(strea
         "provider_settings": {"unsupported_streaming_strategy": "realtime_segmenting"}
     }
     await stage.process(stream.event)
-    assert messages == ["- 准备。\n  - 子项。", "[image]", "完成。"]
+    assert messages == [
+        "- 准备。\n  - 子项。",
+        *(["[image]"] * (2 if direct_send else 1)),
+        "完成。",
+    ]
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+async def test_direct_send_waits_for_inflight_timed_flush(stream, monkeypatch):
+    monkeypatch.setattr("astrbot.core.platform.sources.slack.slack_stream.time", time)
+    updating = asyncio.Event()
+    release = asyncio.Event()
+    direct_send = asyncio.Event()
+    methods = []
+
+    async def api(method, **kwargs):
+        methods.append(method)
+        if method in {"chat.update", "chat.appendStream"}:
+            updating.set()
+            await release.wait()
+        return {"ok": True, "ts": str(len(methods))}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        yield MessageChain([Plain("Before")])
+        yield MessageChain([Plain(" tool")])
+        await updating.wait()
+        direct_send.set()
+        await stream.event.send(
+            MessageChain([Image.fromURL("https://example.com/image.png")])
+        )
+        yield MessageChain([Plain("After")])
+
+    sending = asyncio.create_task(stream.event.send_streaming(chunks()))
+    try:
+        await asyncio.wait_for(direct_send.wait(), timeout=3)
+        # The producer has entered send() while the timer's request is still pending.
+        assert len(methods) == 2
+        release.set()
+        await asyncio.wait_for(sending, timeout=3)
+        assert methods == (
+            [
+                "chat.startStream",
+                "chat.appendStream",
+                "chat.stopStream",
+                "chat.postMessage",
+                "chat.startStream",
+                "chat.stopStream",
+            ]
+            if stream.native
+            else [
+                "chat.postMessage",
+                "chat.update",
+                "chat.postMessage",
+                "chat.postMessage",
+            ]
+        )
+    finally:
+        sending.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+async def test_failed_direct_send_boundary_stops_even_if_tool_catches_error(stream):
+    failure = RuntimeError("Flush response lost")
+
+    async def api(method, **kwargs):
+        if method in {"chat.update", "chat.appendStream"}:
+            raise failure
+        return {"ok": True, "ts": "1"}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        yield MessageChain([Plain("Before")])
+        yield MessageChain([Plain(" tool")])
+        with pytest.raises(RuntimeError, match="Flush response lost"):
+            await stream.event.send(
+                MessageChain([Image.fromURL("https://example.com/image.png")])
+            )
+        yield MessageChain([Plain("After")])
+
+    with pytest.raises(RuntimeError, match="Flush response lost"):
+        await stream.event.send_streaming(chunks())
+    calls = stream.api.await_args_list
+    assert not any("blocks" in call.kwargs["json"] for call in calls)
+    assert sum(call.args[0] == "chat.update" for call in calls) == 1
+    assert stream.event._stream is None

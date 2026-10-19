@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import nullcontext
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
@@ -47,6 +48,7 @@ class SlackMessageEvent(AstrMessageEvent):
     ) -> None:
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.web_client = web_client
+        self._stream: SlackMessageStream | None = None
 
     @staticmethod
     async def _from_segment_to_slack_block(
@@ -440,25 +442,37 @@ class SlackMessageEvent(AstrMessageEvent):
                 )
 
     async def send(self, message: MessageChain) -> None:
-        # RespondStage sends audio separately from the remaining dual-output text.
-        result = self.get_result()
-        plain_texts = {
-            segment.text
-            for segment in (result.chain if result else [])
-            if isinstance(segment, Plain)
-        }
-        raw = getattr(self.message_obj, "raw_message", None)
-        raw = raw if isinstance(raw, dict) else {}
-        await self._send_message(
-            message,
-            self.web_client,
-            channel_id=raw.get("channel")
-            or self.get_group_id()
-            or self.get_sender_id(),
-            plain_texts=plain_texts,
-            thread_ts=raw.get("thread_ts"),
-        )
-        await super().send(message)
+        stream = self._stream
+        # Stream-owned media already runs under the lock and seals its text first.
+        external = stream is not None and asyncio.current_task() is not stream.task
+        async with stream.lock if external else nullcontext():
+            if external:
+                try:
+                    await stream._flush(final=True)
+                except Exception as exc:
+                    # Tools may catch send errors; the consumer must still stop
+                    # rather than retry a flush with an unknown delivery outcome.
+                    stream.error = exc
+                    raise
+            # RespondStage sends audio separately from the remaining dual-output text.
+            result = self.get_result()
+            plain_texts = {
+                segment.text
+                for segment in (result.chain if result else [])
+                if isinstance(segment, Plain)
+            }
+            raw = getattr(self.message_obj, "raw_message", None)
+            raw = raw if isinstance(raw, dict) else {}
+            await self._send_message(
+                message,
+                self.web_client,
+                channel_id=raw.get("channel")
+                or self.get_group_id()
+                or self.get_sender_id(),
+                plain_texts=plain_texts,
+                thread_ts=raw.get("thread_ts"),
+            )
+            await super().send(message)
 
     async def send_streaming(
         self,
@@ -471,7 +485,11 @@ class SlackMessageEvent(AstrMessageEvent):
             generator: Ordered response deltas and components.
             use_fallback: Retained for the shared interface; Slack supports streaming.
         """
-        await SlackMessageStream(self).run(generator)
+        self._stream = SlackMessageStream(self)
+        try:
+            await self._stream.run(generator)
+        finally:
+            self._stream = None
         return await super().send_streaming(generator, use_fallback)
 
     async def get_group(self, group_id=None, **kwargs):
