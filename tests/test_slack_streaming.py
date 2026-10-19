@@ -3,6 +3,7 @@ import re
 import time
 import wave
 from contextvars import ContextVar
+from copy import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -255,6 +256,74 @@ async def test_stream_failure_recovery_does_not_duplicate_text(
     else:
         sleep.assert_awaited_once_with(2.0)
         assert calls[0] == calls[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_scope",
+        "feature_not_enabled",
+        "invalid_thread_ts",
+        "not_allowed",
+        "timeout",
+        "ratelimited",
+        "auth_scope",
+    ],
+)
+async def test_native_capability_cache_is_limited_to_client_and_feature_errors(
+    stream, monkeypatch, failure
+):
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_stream.asyncio.sleep", AsyncMock()
+    )
+    attempts = 0
+    if failure == "auth_scope":
+        stream.event.message_obj.raw_message.pop("team")
+
+    async def api(method, **kwargs):
+        nonlocal attempts
+        if method == "auth.test" and failure == "auth_scope":
+            raise SlackApiError("Auth rejected", {"error": "missing_scope"})
+        if method == "chat.startStream":
+            attempts += 1
+            if attempts == 1 and failure != "auth_scope":
+                if failure == "timeout":
+                    raise TimeoutError("Unknown delivery outcome")
+                raise SlackApiError("Rejected", {"error": failure})
+        return {"ok": True, "ts": "1.0"}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        yield MessageChain([Plain("- Parent\n  - Child")])
+
+    if failure == "timeout":
+        with pytest.raises(TimeoutError):
+            await stream.event.send_streaming(chunks())
+    else:
+        await stream.event.send_streaming(chunks())
+    after_first = attempts
+    incoming = copy(stream.event.message_obj)
+    incoming.raw_message = {"channel": "C456", "thread_ts": "0.2", "team": "T123"}
+    next_event = SlackMessageEvent(
+        "next", incoming, stream.event.platform_meta, "C456", stream.event.web_client
+    )
+    await next_event.send_streaming(chunks())
+    cached = failure in {"missing_scope", "feature_not_enabled"}
+    assert attempts == after_first + (0 if cached else 1)
+    next_post = stream.api.await_args_list[-1 if cached else -2]
+    assert next_post.kwargs["json"]["channel"] == "C456"
+    assert next_post.kwargs["json"]["thread_ts"] == "0.2"
+
+    # Recreating the adapter's client (e.g. after changing app permissions)
+    # permits a new capability probe without affecting other bots.
+    next_event.web_client = AsyncWebClient(token="another-bot")
+    next_event.web_client.api_call = stream.api
+    before_new_client = attempts
+    await next_event.send_streaming(chunks())
+    assert attempts == before_new_client + 1
 
 
 @pytest.mark.asyncio

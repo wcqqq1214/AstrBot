@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from copy import copy
 from typing import TYPE_CHECKING
+from weakref import WeakSet
 
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
@@ -18,6 +19,14 @@ from .slack_markdown import split_slack_markdown
 
 if TYPE_CHECKING:
     from .slack_event import SlackMessageEvent
+
+_UNSUPPORTED_STREAM_CLIENTS: WeakSet[AsyncWebClient] = WeakSet()
+_STREAM_CAPABILITY_ERRORS = {
+    "missing_scope",
+    "feature_not_enabled",
+    "invalid_method",
+    "unknown_method",
+}
 
 
 async def slack_api_request(client: AsyncWebClient, method: str, **kwargs):
@@ -77,8 +86,10 @@ class SlackMessageStream:
         )
         self.thread = raw.get("thread_ts")
         self.team = raw.get("user_team") or raw.get("team")
-        self.native = bool(self.thread) and callable(
-            getattr(self.client, "chat_startStream", None)
+        self.native = (
+            bool(self.thread)
+            and self.client not in _UNSUPPORTED_STREAM_CLIENTS
+            and callable(getattr(self.client, "chat_startStream", None))
         )
         self.ts: str | None = None
         self.text = ""
@@ -114,12 +125,14 @@ class SlackMessageStream:
             self.native = False
 
         if self.native:
+            start_attempted = False
             try:
                 if self.ts is None:
                     if not self.team:
                         self.team = (await slack_api_request(self.client, "auth_test"))[
                             "team_id"
                         ]
+                    start_attempted = True
                     response = await slack_api_request(
                         self.client,
                         "chat_startStream",
@@ -149,19 +162,22 @@ class SlackMessageStream:
                 if self.ts is None:
                     # An ambiguous start may already have created a message.
                     # Only explicit capability rejections permit a new post.
-                    if not isinstance(exc, SlackApiError) or exc.response.get(
-                        "error"
-                    ) not in {
-                        "missing_scope",
+                    error = (
+                        exc.response.get("error")
+                        if isinstance(exc, SlackApiError)
+                        else None
+                    )
+                    if error not in _STREAM_CAPABILITY_ERRORS and error not in {
                         "not_allowed",
-                        "feature_not_enabled",
-                        "invalid_method",
-                        "unknown_method",
                         "streaming_not_allowed",
                         "invalid_thread_ts",
                         "channel_type_not_supported",
                     }:
                         raise
+                    if start_attempted and error in _STREAM_CAPABILITY_ERRORS:
+                        # Cache only app-level capability failures, scoped to this
+                        # adapter's client lifetime. Thread errors remain local.
+                        _UNSUPPORTED_STREAM_CLIENTS.add(self.client)
                 else:
                     # Close without appending anything, then replace the same
                     # message with the full buffer. A timeout may have delivered
