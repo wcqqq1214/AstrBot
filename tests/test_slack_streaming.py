@@ -5,7 +5,7 @@ import wave
 from contextvars import ContextVar
 from copy import copy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiohttp import ServerDisconnectedError, web
@@ -1128,6 +1128,9 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
     "failure",
     [
         "rejected",
+        "missing_scope",
+        "transport",
+        "malformed_error",
         "start_lost",
         "append_lost",
         "stop_lost",
@@ -1137,6 +1140,10 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
 )
 async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, failure):
     stream.event.native_task_cards = True
+    progress_logger = Mock()
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_task_cards.logger", progress_logger
+    )
     requests = []
     failed = False
     sleep = AsyncMock()
@@ -1151,7 +1158,15 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
         targeted = (
             (
                 body.get("task_display_mode")
-                and failure in {"rejected", "start_lost", "rate_limit"}
+                and failure
+                in {
+                    "rejected",
+                    "missing_scope",
+                    "transport",
+                    "malformed_error",
+                    "start_lost",
+                    "rate_limit",
+                }
             )
             or (
                 "chunks" in body
@@ -1166,6 +1181,18 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
         )
         if targeted and not failed:
             failed = True
+            if failure == "transport":
+                raise ConnectionError("private-response-content")
+            if failure in {"missing_scope", "malformed_error"}:
+                raise SlackApiError(
+                    "private-response-content",
+                    {
+                        "error": "missing_scope"
+                        if failure == "missing_scope"
+                        else "private-response-content\nextra",
+                        "detail": "private-response-content",
+                    },
+                )
             if failure in {"rejected", "rate_limit", "stop_rate_limit"}:
                 raise SlackApiError(
                     "controlled failure",
@@ -1175,7 +1202,7 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
                         else "ratelimited"
                     },
                 )
-            raise TimeoutError("accepted but response lost")
+            raise TimeoutError("private-response-content")
         return {"ok": True, "ts": body.get("ts", str(len(requests)))}
 
     stream.api.side_effect = api
@@ -1217,6 +1244,28 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
         ]
         assert updates[-1]["title"].endswith("（状态未确认）")
     assert stream.event._stream is None
+    expected_method = (
+        "chat_stopStream"
+        if failure.startswith("stop_")
+        else "chat_appendStream"
+        if failure == "append_lost"
+        else "chat_startStream"
+    )
+    expected_error = {
+        "rejected": "invalid_arguments",
+        "missing_scope": "missing_scope",
+        "transport": "ConnectionError",
+        "malformed_error": "SlackApiError",
+        "rate_limit": "ratelimited",
+        "stop_rate_limit": "ratelimited",
+    }.get(failure, "TimeoutError")
+    progress_logger.warning.assert_any_call(
+        "Slack task progress request failed: method=%s error=%s.",
+        expected_method,
+        expected_error,
+    )
+    assert "private-response-content" not in str(progress_logger.mock_calls)
+    assert all(not call.kwargs.get("exc_info") for call in progress_logger.mock_calls)
 
 
 @pytest.mark.asyncio
@@ -1226,6 +1275,10 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
 )
 async def test_stalled_progress_is_bounded_through_respond(stream, monkeypatch, stalled):
     stream.event.native_task_cards = True
+    progress_logger = Mock()
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_task_cards.logger", progress_logger
+    )
     monkeypatch.setattr(
         "astrbot.core.platform.sources.slack.slack_task_cards._PROGRESS_REQUEST_TIMEOUT",
         0.1,
@@ -1299,6 +1352,12 @@ async def test_stalled_progress_is_bounded_through_respond(stream, monkeypatch, 
             release.set()
     assert client.timeout == original_timeout
     assert client.retry_handlers == original_retries
+    progress_logger.warning.assert_any_call(
+        "Slack task progress request failed: method=%s error=%s.",
+        target.replace(".", "_"),
+        "TimeoutError",
+    )
+    assert all(not call.kwargs.get("exc_info") for call in progress_logger.mock_calls)
     assert len(stalled_requests) == 1
     assert sum(bool(body.get("task_display_mode")) for _, body in requests) == 1
     assert sum(

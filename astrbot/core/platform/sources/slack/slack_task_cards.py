@@ -1,6 +1,7 @@
 """Optional task progress, independent of Slack answer delivery."""
 
 import asyncio
+import re
 import time
 from copy import copy
 from typing import TYPE_CHECKING
@@ -55,8 +56,22 @@ class SlackTaskCards:
             return await asyncio.wait_for(
                 getattr(client, method)(**kwargs), timeout=_PROGRESS_REQUEST_TIMEOUT
             )
-        except SlackApiError as exc:
-            if exc.response.get("error") in {"ratelimited", "rate_limited"}:
+        except Exception as exc:
+            error = type(exc).__name__
+            if isinstance(exc, SlackApiError):
+                code = exc.response.get("error")
+                if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,64}", code):
+                    error = code
+            # SDK exception strings and tracebacks may contain request/response data.
+            logger.warning(
+                "Slack task progress request failed: method=%s error=%s.",
+                method,
+                error,
+            )
+            if isinstance(exc, SlackApiError) and exc.response.get("error") in {
+                "ratelimited",
+                "rate_limited",
+            }:
                 headers = getattr(exc.response, "headers", {}) or {}
                 try:
                     delay = float(
@@ -161,7 +176,10 @@ class SlackTaskCards:
                 }
                 self.disabled = not self.fallback
                 logger.warning(
-                    "Slack task cards unavailable; answer delivery continues."
+                    "Slack task cards unavailable; %s. Answer delivery continues.",
+                    "switching to text progress"
+                    if self.fallback
+                    else "progress updates disabled",
                 )
                 await self.close()
         if self.fallback:
@@ -197,7 +215,9 @@ class SlackTaskCards:
                 }:
                     return
                 self.disabled = True
-                logger.warning("Slack task progress fallback failed.", exc_info=True)
+                logger.warning(
+                    "Slack text progress updates disabled; answer delivery continues."
+                )
 
     async def close(self) -> None:
         """Seal progress without allowing cleanup failures to suppress the answer."""
@@ -230,7 +250,9 @@ class SlackTaskCards:
                     parse="full",
                 )
             except Exception:
-                logger.warning("Slack text progress cleanup failed.", exc_info=True)
+                logger.warning(
+                    "Slack text progress cleanup failed; no retry scheduled."
+                )
         if not self.ts:
             return
         channel = self.event.message_obj.raw_message["channel"]
@@ -259,6 +281,6 @@ class SlackTaskCards:
                 **({"chunks": pending} if pending else {}),
             )
         except Exception:
-            logger.warning("Slack task-card cleanup failed.", exc_info=True)
+            logger.warning("Slack task-card cleanup failed; no retry scheduled.")
         finally:
             self.ts = None
