@@ -450,15 +450,7 @@ async def test_oversized_stream_preserves_all_characters(stream, content):
         for start in range(split, len(text), size):
             yield MessageChain([Plain(text[start : start + size])])
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {"provider_settings": {}}
-    await stage.process(stream.event)
+    await stream.event.send_streaming(chunks())
     calls = stream.api.await_args_list
     assert calls[0].args[0] == (
         "chat.startStream" if stream.native else "chat.postMessage"

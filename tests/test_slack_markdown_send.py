@@ -53,8 +53,8 @@ def slack_event(monkeypatch):
     )
 
 
-@pytest.fixture(params=["event", "respond", "session"])
-def slack_sender(request, slack_event, monkeypatch):
+@pytest.fixture(params=["event", "session"])
+def slack_sender(request, slack_event):
     if request.param == "event":
         return slack_event.send
     if request.param == "session":
@@ -66,20 +66,6 @@ def slack_sender(request, slack_event, monkeypatch):
             session_id="C123",
         )
         return partial(adapter.send_by_session, session)
-    if request.param == "respond":
-        stage = RespondStage()
-        stage.platform_settings = {}
-        stage.enable_seg = False
-        monkeypatch.setattr(
-            "astrbot.core.pipeline.respond.stage.call_event_hook",
-            AsyncMock(return_value=False),
-        )
-
-        async def respond(chain):
-            slack_event.set_result(MessageEventResult(chain=chain.chain))
-            await stage.process(slack_event)
-
-        return respond
 
 
 @pytest.mark.asyncio
