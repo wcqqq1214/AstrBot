@@ -155,6 +155,33 @@ class SlackTaskCards:
 
     async def close(self) -> None:
         """Seal progress without allowing cleanup failures to suppress the answer."""
+        if (
+            self.fallback_ts
+            and not self.disabled
+            and any(task["status"] == "in_progress" for task in self.tasks.values())
+        ):
+            # Attempt cleanup once; never resume progress after an uncertain write.
+            self.disabled = True
+            statuses = {
+                "in_progress": "状态未确认",
+                "complete": "已完成",
+                "error": "失败",
+            }
+            try:
+                await slack_api_request(
+                    self.event.web_client,
+                    "chat_update",
+                    channel=self.event.message_obj.raw_message["channel"],
+                    ts=self.fallback_ts,
+                    text="AstrBot 工具进度\n"
+                    + "\n".join(
+                        f"• {task['title']}：{statuses[task['status']]}"
+                        for task in self.tasks.values()
+                    ),
+                    parse="full",
+                )
+            except Exception:
+                logger.warning("Slack text progress cleanup failed.", exc_info=True)
         if not self.ts:
             return
         client = self.event.web_client

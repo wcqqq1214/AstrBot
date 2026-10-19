@@ -1348,6 +1348,93 @@ async def test_task_card_text_fallback_edits_one_message_through_respond(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize("ending", ["cancel", "error", "aborted", "rejected", "lost"])
+async def test_text_progress_closes_pending_tasks_through_respond(stream, ending):
+    stream.event.native_task_cards = True
+    started = asyncio.Event()
+    progress = []
+
+    async def api(method, **kwargs):
+        body = kwargs["json"]
+        if body.get("task_display_mode") == "plan":
+            raise SlackApiError("cards unavailable", {"error": "invalid_arguments"})
+        if body.get("text", "").startswith("AstrBot 工具进度"):
+            progress.append((method, body))
+            if "状态未确认" in body["text"]:
+                if ending == "rejected":
+                    raise SlackApiError(
+                        "message deleted", {"error": "message_not_found"}
+                    )
+                if ending == "lost":
+                    raise TimeoutError("write accepted but response lost")
+            return {"ok": True, "ts": "progress"}
+        return {"ok": True, "ts": body.get("ts", "answer")}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        for task_id in ("done", "failed", "pending"):
+            yield MessageChain(
+                [Json(data={"id": task_id, "name": task_id})], type="tool_call"
+            )
+            if task_id != "pending":
+                yield MessageChain(
+                    [Json(data={"id": task_id, "is_error": task_id == "failed"})],
+                    type="tool_call_result",
+                )
+        started.set()
+        if ending == "cancel":
+            await asyncio.Event().wait()
+        elif ending == "error":
+            raise RuntimeError("generation failed")
+        elif ending == "aborted":
+            yield MessageChain([], type="aborted")
+        else:
+            yield MessageChain([Plain("Final")])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    sending = asyncio.create_task(stage.process(stream.event))
+    try:
+        if ending == "cancel":
+            await asyncio.wait_for(started.wait(), timeout=2)
+            sending.cancel()
+        if ending in {"cancel", "error"}:
+            with pytest.raises(
+                asyncio.CancelledError if ending == "cancel" else RuntimeError
+            ):
+                await sending
+        else:
+            await sending
+    finally:
+        sending.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
+
+    assert [method for method, _ in progress] == ["chat.postMessage"] + [
+        "chat.update"
+    ] * 5
+    assert progress[-1][1] == {
+        "channel": "C123",
+        "ts": "progress",
+        "text": "AstrBot 工具进度\n• done：已完成\n• failed：失败\n• pending：状态未确认",
+        "parse": "full",
+    }
+    if ending in {"rejected", "lost"}:
+        assert any(
+            call.kwargs["json"].get("markdown_text") == "Final"
+            for call in stream.api.await_args_list
+        )
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
 async def test_cancelled_task_card_is_not_marked_complete(stream):
     stream.event.native_task_cards = True
 
