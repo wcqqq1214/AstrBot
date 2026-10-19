@@ -24,6 +24,7 @@ from astrbot.api.platform import Group, MessageMember
 from astrbot.core.platform.button_interaction import encode_button_callback
 from astrbot.core.utils.media_utils import MediaResolver, file_uri_to_path
 
+from .slack_markdown import split_slack_markdown
 from .slack_stream import SlackMessageStream, slack_api_request
 
 _BLOCK_FORMAT_ERRORS = {
@@ -284,20 +285,62 @@ class SlackMessageEvent(AstrMessageEvent):
             )
             if not content.strip():
                 return
-            # Slack forbids text/blocks alongside markdown_text and caps it at 12k.
-            # Keep oversized messages on the existing delivery path.
-            if len(content) <= 12_000:
+            for part in split_slack_markdown(content):
+                if not part.strip():
+                    continue
                 await slack_api_request(
                     web_client,
                     "chat_postMessage",
                     **destination,
-                    markdown_text=content,
+                    markdown_text=part,
                 )
-                return
+            return
 
         plain_texts = (plain_texts or set()) | {
             segment.text for segment in message.chain if isinstance(segment, Plain)
         }
+        if (
+            sum(
+                len(segment.text)
+                if isinstance(segment, Plain)
+                else len(f"<@{segment.qq}>")
+                for segment in message.chain
+                if isinstance(segment, (Plain, At))
+            )
+            > 12_000
+        ):
+            # Oversized mixed replies keep text on the Markdown path, with media
+            # delivered at its original position between contiguous text runs.
+            pending = []
+            for segment in message.chain:
+                if isinstance(segment, (Plain, Reply, At)):
+                    pending.append(segment)
+                    continue
+                if pending:
+                    await SlackMessageEvent._send_message(
+                        message.derive(pending),
+                        web_client,
+                        channel_id,
+                        plain_texts,
+                        thread_ts,
+                    )
+                    pending = []
+                await SlackMessageEvent._send_message(
+                    message.derive([segment]),
+                    web_client,
+                    channel_id,
+                    plain_texts,
+                    thread_ts,
+                )
+            if pending:
+                await SlackMessageEvent._send_message(
+                    message.derive(pending),
+                    web_client,
+                    channel_id,
+                    plain_texts,
+                    thread_ts,
+                )
+            return
         # Upload each audio segment only after delivering preceding components.
         chains = []
         start = 0

@@ -1,3 +1,4 @@
+import re
 from copy import deepcopy
 from functools import partial
 from types import SimpleNamespace
@@ -116,22 +117,19 @@ async def test_slack_reply_preserves_markdown(
 @pytest.mark.parametrize("length", [12_000, 12_001])
 async def test_slack_markdown_length_limit(slack_event, length, mentioned):
     prefix = "<@U456>" if mentioned else ""
-    text = "a" * (length - len(prefix))
+    text = "\n\n" + "a" * (length - len(prefix) - 2)
     chain = [At(qq="U456"), Plain(text)] if mentioned else [Plain(text)]
     await slack_event.send(MessageChain(chain))
     content = prefix + text
 
-    payload = slack_event.web_client.api_call.await_args.kwargs["json"]
-    if length == 12_000:
-        assert payload == {"channel": "C123", "markdown_text": content}
-    else:
-        assert payload == {
-            "channel": "C123",
-            "text": "",
-            "blocks": [
-                {"type": "section", "text": {"type": "mrkdwn", "text": content}}
-            ],
-        }
+    payloads = [
+        c.kwargs["json"] for c in slack_event.web_client.api_call.await_args_list
+    ]
+    assert len(payloads) == (1 if length == 12_000 else 2)
+    assert all(set(p) == {"channel", "markdown_text"} for p in payloads)
+    assert all(len(p["markdown_text"]) <= 12_000 for p in payloads)
+    assert all(p["markdown_text"].strip() for p in payloads)
+    assert "".join(p["markdown_text"] for p in payloads) == content
 
 
 @pytest.mark.asyncio
@@ -446,14 +444,51 @@ async def test_slack_mixed_markdown_limit_is_cumulative(slack_event, length):
         )
     )
 
-    slack_event.web_client.api_call.assert_awaited_once()
-    blocks = slack_event.web_client.api_call.await_args.kwargs["json"]["blocks"]
-    text_type = "markdown" if length == 12_000 else "section"
-    assert [block["type"] for block in blocks] == [text_type, "image", text_type]
+    payloads = [
+        c.kwargs["json"] for c in slack_event.web_client.api_call.await_args_list
+    ]
     if length == 12_000:
+        assert len(payloads) == 1
+        blocks = payloads[0]["blocks"]
+        assert [block["type"] for block in blocks] == ["markdown", "image", "markdown"]
         assert [blocks[0]["text"], blocks[2]["text"]] == [before, after]
     else:
-        assert [blocks[0]["text"]["text"], blocks[2]["text"]["text"]] == [before, after]
+        assert len(payloads) == 3
+        assert payloads[0]["markdown_text"] == before
+        assert payloads[1]["blocks"][0]["type"] == "image"
+        assert payloads[2]["markdown_text"] == after
+
+
+@pytest.mark.asyncio
+async def test_long_code_reply_keeps_fences_and_image_order(slack_event, slack_sender):
+    code = "    print('缩进不能丢')\n" * 1800
+    before = "说明。\n\n" * 1800 + "```python\n" + code + "```\n\n"
+    after = "- Parent\n  - Child\n    - Grandchild\n\nAfter."
+    await slack_sender(
+        MessageChain(
+            [
+                Plain(before),
+                Image.fromURL("https://example.com/image.png"),
+                Plain(after),
+            ]
+        )
+    )
+    payloads = [
+        c.kwargs["json"] for c in slack_event.web_client.api_call.await_args_list
+    ]
+    assert payloads[-2]["blocks"][0]["type"] == "image"
+    assert payloads[-1]["markdown_text"] == after
+    chunks = [p["markdown_text"] for p in payloads[:-2]]
+    assert all(len(part) <= 12_000 for part in chunks)
+    assert sum(part.count("说明。\n\n") for part in chunks) == 1800
+    assert (
+        "".join(
+            block
+            for part in chunks
+            for block in re.findall(r"```python\n(.*?)```", part, re.S)
+        )
+        == code
+    )
 
 
 @pytest.mark.asyncio

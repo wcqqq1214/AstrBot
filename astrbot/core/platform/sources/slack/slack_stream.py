@@ -14,6 +14,8 @@ from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import At, Plain, Reply
 
+from .slack_markdown import split_slack_markdown
+
 if TYPE_CHECKING:
     from .slack_event import SlackMessageEvent
 
@@ -100,14 +102,10 @@ class SlackMessageStream:
         ):
             return
 
-        # Oversized text uses the plain-text field. Never submit more than 12k
-        # characters to Markdown or replay a native append.
-        body = (
-            {"markdown_text": self.text}
-            if len(self.text) <= 12_000
-            else {"text": self.text, "blocks": []}
-        )
-        if self.native and len(self.text) > 12_000:
+        body = {"markdown_text": self.text}
+        # A safe split may move already-visible text to the next message. Replace
+        # the existing head in place instead of appending overlapping characters.
+        if self.native and self.sent and not self.text.startswith(self.sent):
             if self.open:
                 await slack_api_request(
                     self.client, "chat_stopStream", channel=self.channel, ts=self.ts
@@ -273,14 +271,11 @@ class SlackMessageStream:
                                 if isinstance(component, Plain)
                                 else f"<@{component.qq}>"
                             )
-                            # Slack truncates text above 40k. Split oversized text
-                            # while preserving every source character.
-                            while text:
-                                remaining = 39_000 - len(self.text)
-                                self.text += text[:remaining]
-                                text = text[remaining:]
-                                if text:
-                                    await self._flush(final=True)
+                            parts = split_slack_markdown(self.text + text)
+                            for part in parts[:-1]:
+                                self.text = part
+                                await self._flush(final=True)
+                            self.text = parts[-1]
                             await self._flush()
                         else:
                             await self._flush(final=True)

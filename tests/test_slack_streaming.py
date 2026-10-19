@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 import wave
 from contextvars import ContextVar
@@ -347,23 +348,57 @@ async def test_paused_generation_flushes_without_advancing_boundaries(
 
 
 @pytest.mark.asyncio
-async def test_oversized_stream_preserves_all_characters(stream):
-    text = "a" * 12001 + "b" * 28000
+@pytest.mark.parametrize("content", ["plain", "code", "already_visible_list"])
+async def test_oversized_stream_preserves_all_characters(stream, content):
+    code = "    print('缩进')\n" * 3000
+    text = {
+        "plain": "a" * 12001 + "b" * 28000,
+        "code": "```python\n" + code + "```",
+        "already_visible_list": "a" * 5000 + "\n\n- Parent\n" + "  - Child\n" * 750,
+    }[content]
+    messages = {}
+    methods = []
+
+    async def api(method, **kwargs):
+        methods.append(method)
+        body = kwargs["json"]
+        ts = body.get("ts", str(len(messages) + 1))
+        if method in {"chat.postMessage", "chat.startStream", "chat.update"}:
+            assert len(body["markdown_text"]) <= 12_000
+            messages[ts] = body["markdown_text"]
+        elif method == "chat.appendStream":
+            messages[ts] += body["markdown_text"]
+        return {"ok": True, "ts": ts}
+
+    stream.api.side_effect = api
+    split = 11990 if content == "already_visible_list" else 10
 
     async def chunks():
-        yield MessageChain([Plain(text[:10])])
-        yield MessageChain([Plain(text[10:])])
+        yield MessageChain([Plain(text[:split])])
+        yield MessageChain([Plain(text[split:])])
 
     await stream.event.send_streaming(chunks())
     calls = stream.api.await_args_list
     assert calls[0].args[0] == (
         "chat.startStream" if stream.native else "chat.postMessage"
     )
-    updates = [c.kwargs["json"] for c in calls if c.args[0] == "chat.update"]
-    posts = [c.kwargs["json"] for c in calls if c.args[0] == "chat.postMessage"]
-    assert updates[0]["text"] == text[:39000]
-    assert posts[-1]["markdown_text"] == text[39000:]
-    assert updates[0]["blocks"] == []
+    assert len(messages) > 1
+    assert all(len(part) <= 12_000 for part in messages.values())
+    if content == "code":
+        assert (
+            "".join(
+                block
+                for part in messages.values()
+                for block in re.findall(r"```python\n(.*?)```", part, re.S)
+            )
+            == code
+        )
+    else:
+        assert "".join(messages.values()) == text
+    if content == "already_visible_list":
+        assert messages["2"].startswith("- Parent\n  - Child")
+        if stream.native:
+            assert methods[:3] == ["chat.startStream", "chat.stopStream", "chat.update"]
 
 
 @pytest.mark.asyncio
