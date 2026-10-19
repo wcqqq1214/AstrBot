@@ -24,7 +24,15 @@ from astrbot.api.platform import Group, MessageMember
 from astrbot.core.platform.button_interaction import encode_button_callback
 from astrbot.core.utils.media_utils import MediaResolver, file_uri_to_path
 
-from .slack_stream import SlackMessageStream
+from .slack_stream import SlackMessageStream, slack_api_request
+
+_BLOCK_FORMAT_ERRORS = {
+    "invalid_blocks",
+    "invalid_blocks_format",
+    "msg_blocks_too_long",
+    "msg_too_long",
+    "too_many_blocks",
+}
 
 
 class SlackMessageEvent(AstrMessageEvent):
@@ -279,7 +287,9 @@ class SlackMessageEvent(AstrMessageEvent):
             # Slack forbids text/blocks alongside markdown_text and caps it at 12k.
             # Keep oversized messages on the existing delivery path.
             if len(content) <= 12_000:
-                await web_client.chat_postMessage(
+                await slack_api_request(
+                    web_client,
+                    "chat_postMessage",
                     **destination,
                     markdown_text=content,
                 )
@@ -335,31 +345,31 @@ class SlackMessageEvent(AstrMessageEvent):
                         for block in markdown_blocks
                     )
                     try:
-                        await web_client.chat_postMessage(
+                        await slack_api_request(
+                            web_client,
+                            "chat_postMessage",
                             **destination,
                             text=fallback_text,
                             blocks=markdown_blocks,
                         )
                     except SlackApiError as error:
-                        if error.response.get("error") not in {
-                            "invalid_blocks",
-                            "invalid_blocks_format",
-                            "msg_blocks_too_long",
-                            "msg_too_long",
-                            "too_many_blocks",
-                        }:
+                        if error.response.get("error") not in _BLOCK_FORMAT_ERRORS:
                             raise
                     else:
                         continue
 
             try:
-                await web_client.chat_postMessage(
+                await slack_api_request(
+                    web_client,
+                    "chat_postMessage",
                     **destination,
                     text=text,
                     blocks=blocks or None,
                 )
-            except Exception:
-                # Retry only this part so already delivered parts are not repeated.
+            except SlackApiError as error:
+                if error.response.get("error") not in _BLOCK_FORMAT_ERRORS:
+                    raise
+                # Downgrade only explicitly rejected formatting, never uncertain delivery.
                 parts = []
                 for segment in chain.chain:
                     if isinstance(segment, Plain):
@@ -379,7 +389,9 @@ class SlackMessageEvent(AstrMessageEvent):
                         isinstance(segment, Record) and segment.text not in plain_texts
                     ):
                         parts.append(segment.text or "[Audio]")
-                await web_client.chat_postMessage(
+                await slack_api_request(
+                    web_client,
+                    "chat_postMessage",
                     **destination,
                     text="".join(parts),
                 )

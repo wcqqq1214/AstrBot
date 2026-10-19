@@ -7,6 +7,7 @@ from copy import copy
 from typing import TYPE_CHECKING
 
 from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
@@ -14,6 +15,46 @@ from astrbot.api.message_components import At, Plain, Reply
 
 if TYPE_CHECKING:
     from .slack_event import SlackMessageEvent
+
+
+async def slack_api_request(client: AsyncWebClient, method: str, **kwargs):
+    """Call Slack, retrying once only after an explicit rate-limit rejection.
+
+    Args:
+        client: Shared Slack client; its retry settings are left unchanged.
+        method: SDK method name.
+        **kwargs: Request payload.
+
+    Returns:
+        Slack's response, including confirmation that a stream is already closed.
+
+    Raises:
+        SlackApiError: Slack rejects the request or the retry.
+    """
+    if method in {"chat_postMessage", "chat_startStream", "chat_appendStream"}:
+        # A lost response does not mean the write failed. Isolate retry
+        # settings so concurrent requests using the shared client are unaffected.
+        client = copy(client)
+        client.retry_handlers = []
+    try:
+        return await getattr(client, method)(**kwargs)
+    except SlackApiError as exc:
+        # A previous stop may have succeeded despite a lost response.
+        if (
+            method == "chat_stopStream"
+            and exc.response.get("error") == "message_not_in_streaming_state"
+        ):
+            return exc.response
+        if exc.response.get("error") not in {"ratelimited", "rate_limited"}:
+            raise
+        headers = getattr(exc.response, "headers", {}) or {}
+        await asyncio.sleep(
+            max(
+                1.0,
+                float(headers.get("Retry-After", headers.get("retry-after", "1"))),
+            )
+        )
+        return await getattr(client, method)(**kwargs)
 
 
 class SlackMessageStream:
@@ -42,45 +83,6 @@ class SlackMessageStream:
         self.open = False
         self.last_update = 0.0
 
-    async def _request(self, method: str, **kwargs):
-        """Call Slack, retrying once only after an explicit rate-limit rejection.
-
-        Args:
-            method: SDK method name.
-            **kwargs: Request payload.
-
-        Returns:
-            Slack's response, including confirmation that a stream is already closed.
-
-        Raises:
-            SlackApiError: Slack rejects the request or the retry.
-        """
-        client = self.client
-        if method in {"chat_postMessage", "chat_startStream", "chat_appendStream"}:
-            # A lost response does not mean the write failed. Isolate retry
-            # settings so concurrent requests using the shared client are unaffected.
-            client = copy(client)
-            client.retry_handlers = []
-        try:
-            return await getattr(client, method)(**kwargs)
-        except SlackApiError as exc:
-            # A previous stop may have succeeded despite a lost response.
-            if (
-                method == "chat_stopStream"
-                and exc.response.get("error") == "message_not_in_streaming_state"
-            ):
-                return exc.response
-            if exc.response.get("error") not in {"ratelimited", "rate_limited"}:
-                raise
-            headers = getattr(exc.response, "headers", {}) or {}
-            await asyncio.sleep(
-                max(
-                    1.0,
-                    float(headers.get("Retry-After", headers.get("retry-after", "1"))),
-                )
-            )
-            return await getattr(client, method)(**kwargs)
-
     async def _flush(self, final: bool = False) -> None:
         """Publish accumulated text, sealing it at a content boundary.
 
@@ -106,7 +108,9 @@ class SlackMessageStream:
         )
         if self.native and len(self.text) > 12_000:
             if self.open:
-                await self._request("chat_stopStream", channel=self.channel, ts=self.ts)
+                await slack_api_request(
+                    self.client, "chat_stopStream", channel=self.channel, ts=self.ts
+                )
                 self.open = False
             self.native = False
 
@@ -114,8 +118,11 @@ class SlackMessageStream:
             try:
                 if self.ts is None:
                     if not self.team:
-                        self.team = (await self._request("auth_test"))["team_id"]
-                    response = await self._request(
+                        self.team = (await slack_api_request(self.client, "auth_test"))[
+                            "team_id"
+                        ]
+                    response = await slack_api_request(
+                        self.client,
                         "chat_startStream",
                         channel=self.channel,
                         thread_ts=self.thread,
@@ -126,7 +133,8 @@ class SlackMessageStream:
                     self.ts = response["ts"]
                     self.open = True
                 elif self.text != self.sent:
-                    await self._request(
+                    await slack_api_request(
+                        self.client,
                         "chat_appendStream",
                         channel=self.channel,
                         ts=self.ts,
@@ -134,8 +142,8 @@ class SlackMessageStream:
                     )
                 self.sent = self.text
                 if final:
-                    await self._request(
-                        "chat_stopStream", channel=self.channel, ts=self.ts
+                    await slack_api_request(
+                        self.client, "chat_stopStream", channel=self.channel, ts=self.ts
                     )
                     self.open = False
             except Exception as exc:
@@ -160,8 +168,11 @@ class SlackMessageStream:
                     # message with the full buffer. A timeout may have delivered
                     # the delta already; retrying that delta would duplicate it.
                     try:
-                        await self._request(
-                            "chat_stopStream", channel=self.channel, ts=self.ts
+                        await slack_api_request(
+                            self.client,
+                            "chat_stopStream",
+                            channel=self.channel,
+                            ts=self.ts,
                         )
                         self.open = False
                     except Exception:
@@ -177,17 +188,19 @@ class SlackMessageStream:
                 destination = {"channel": self.channel}
                 if self.thread:
                     destination["thread_ts"] = self.thread
-                response = await self._request(
-                    "chat_postMessage", **destination, **body
+                response = await slack_api_request(
+                    self.client, "chat_postMessage", **destination, **body
                 )
                 self.ts = response["ts"]
             elif self.sent != self.text or self.open:
-                await self._request(
-                    "chat_update", channel=self.channel, ts=self.ts, **body
+                await slack_api_request(
+                    self.client, "chat_update", channel=self.channel, ts=self.ts, **body
                 )
             self.sent = self.text
         if final and self.open:
-            await self._request("chat_stopStream", channel=self.channel, ts=self.ts)
+            await slack_api_request(
+                self.client, "chat_stopStream", channel=self.channel, ts=self.ts
+            )
             self.open = False
         self.last_update = time.monotonic()
         if final:
@@ -243,8 +256,8 @@ class SlackMessageStream:
             # open. Do not repost on errors with an unknown delivery outcome.
             if self.open and self.ts:
                 try:
-                    await self._request(
-                        "chat_stopStream", channel=self.channel, ts=self.ts
+                    await slack_api_request(
+                        self.client, "chat_stopStream", channel=self.channel, ts=self.ts
                     )
                 except Exception:
                     logger.warning("Slack stream cleanup failed.", exc_info=True)

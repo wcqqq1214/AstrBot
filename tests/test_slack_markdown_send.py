@@ -4,8 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aiohttp import ServerDisconnectedError, web
+from aiohttp.test_utils import TestServer
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
+from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import At, Image, Plain, Reply
@@ -274,11 +277,10 @@ async def test_slack_mixed_markdown_rejection_reuses_uploaded_image(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error_code", [None, "ratelimited", "invalid_auth", "service_unavailable"]
-)
-async def test_slack_mixed_markdown_does_not_retry_other_errors(
-    slack_event, error_code
+@pytest.mark.parametrize("error_code", [None, "invalid_auth", "service_unavailable"])
+@pytest.mark.parametrize("with_text", [False, True])
+async def test_slack_image_does_not_retry_other_errors(
+    slack_event, error_code, with_text
 ):
     error = (
         SlackApiError("Send failed", {"ok": False, "error": error_code})
@@ -288,13 +290,145 @@ async def test_slack_mixed_markdown_does_not_retry_other_errors(
     slack_event.web_client.api_call.side_effect = error
 
     with pytest.raises(type(error)):
-        await slack_event.send(
-            MessageChain(
-                [Plain("- First"), Image.fromURL("https://example.com/image.png")]
-            )
-        )
+        chain = [Image.fromURL("https://example.com/image.png")]
+        if with_text:
+            chain.insert(0, Plain("- First"))
+        await slack_event.send(MessageChain(chain))
 
     slack_event.web_client.api_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("with_text", "error_code", "exhausted"),
+    [
+        (True, "ratelimited", False),
+        (False, "rate_limited", False),
+        (False, "ratelimited", True),
+    ],
+)
+async def test_slack_image_rate_limit_retries_same_payload_once(
+    slack_event, tmp_path, monkeypatch, with_text, error_code, exhausted
+):
+    client = slack_event.web_client
+    path = tmp_path / "image.png"
+    path.write_bytes(b"test image")
+    client.files_upload_v2 = AsyncMock(
+        return_value={
+            "ok": True,
+            "files": [{"url_private": "https://slack.test/image.png"}],
+        }
+    )
+    response = AsyncSlackResponse(
+        client=client,
+        http_verb="POST",
+        api_url="test",
+        req_args={},
+        data={"ok": False, "error": error_code},
+        headers={"Retry-After": "2"},
+        status_code=429,
+    )
+    error = SlackApiError("Rate limited", response)
+    client.api_call.side_effect = [error, error if exhausted else {"ok": True}]
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_stream.asyncio.sleep", sleep
+    )
+    chain = [Image.fromFileSystem(str(path))]
+    if with_text:
+        chain = [Plain("- Before\n  - Child"), *chain, Plain("After.")]
+
+    if exhausted:
+        with pytest.raises(SlackApiError) as caught:
+            await slack_event.send(MessageChain(chain))
+        assert caught.value is error
+    else:
+        await slack_event.send(MessageChain(chain))
+
+    sleep.assert_awaited_once_with(2.0)
+    client.files_upload_v2.assert_awaited_once()
+    first, retry = client.api_call.await_args_list
+    assert first == retry
+    assert first.args == ("chat.postMessage",)
+    assert [block["type"] for block in first.kwargs["json"]["blocks"]] == (
+        ["markdown", "image", "markdown"] if with_text else ["image"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_slack_image_format_rejections_fall_back_to_text(
+    slack_event, slack_sender
+):
+    client = slack_event.web_client
+    client.api_call.side_effect = [
+        SlackApiError("Rejected Markdown", {"error": "invalid_blocks"}),
+        SlackApiError("Rejected blocks", {"error": "invalid_blocks_format"}),
+        {"ok": True},
+    ]
+
+    await slack_sender(
+        MessageChain(
+            [
+                At(qq="U456"),
+                Plain("Before."),
+                Image.fromURL("https://example.com/image.png"),
+                Plain("After."),
+            ]
+        )
+    )
+
+    native, legacy, fallback = [
+        call.kwargs["json"] for call in client.api_call.await_args_list
+    ]
+    assert [block["type"] for block in native["blocks"]] == [
+        "markdown",
+        "image",
+        "markdown",
+    ]
+    assert [block["type"] for block in legacy["blocks"]] == [
+        "section",
+        "image",
+        "section",
+    ]
+    assert native["blocks"][1] == legacy["blocks"][1]
+    assert fallback == {"channel": "C123", "text": "<@U456>Before. [图片] After."}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_text", [False, True])
+async def test_slack_sdk_lost_image_response_does_not_resend(slack_event, with_text):
+    delivered = []
+
+    async def handle(request):
+        delivered.append(await request.json())
+        if len(delivered) == 1:
+            # Accept the image message, then drop the response below the SDK layer.
+            request.transport.close()
+            return web.Response()
+        return web.json_response({"ok": True, "ts": "1.0"})
+
+    app = web.Application()
+    app.router.add_post("/chat.postMessage", handle)
+    async with TestServer(app) as server:
+        client = AsyncWebClient(token="test", base_url=str(server.make_url("/")))
+        client.proxy = None
+        handlers = client.retry_handlers[:]
+        assert handlers
+        slack_event.web_client = client
+        slack_event.message_obj.raw_message = {"channel": "C123", "thread_ts": "0.1"}
+        chain = [Image.fromURL("https://example.com/image.png")]
+        if with_text:
+            chain = [Plain("Before."), *chain, Plain("After.")]
+
+        with pytest.raises(ServerDisconnectedError):
+            await slack_event.send(MessageChain(chain))
+
+        assert len(delivered) == 1
+        assert delivered[0]["thread_ts"] == "0.1"
+        assert [block["type"] for block in delivered[0]["blocks"]] == (
+            ["markdown", "image", "markdown"] if with_text else ["image"]
+        )
+        assert client.retry_handlers == handlers
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from functools import partial
 from unittest.mock import AsyncMock
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Plain, Record
@@ -70,9 +71,7 @@ async def test_slack_tts_uploads_audio_without_empty_messages(slack_sender, audi
     send, client = slack_sender
     original = audio_path.read_bytes()
 
-    await send(
-        MessageChain([Record(file=str(audio_path), text="Speech test.")])
-    )
+    await send(MessageChain([Record(file=str(audio_path), text="Speech test.")]))
 
     client.files_upload_v2.assert_awaited_once_with(
         file=original, filename="speech.wav", channel="C123"
@@ -117,13 +116,11 @@ async def test_slack_tts_block_failure_retries_source_text(slack_sender, audio_p
     send, client = slack_sender
     client.files_upload_v2.side_effect = RuntimeError("upload failed")
     client.chat_postMessage.side_effect = [
-        RuntimeError("blocks rejected"),
+        SlackApiError("Blocks rejected", {"error": "invalid_blocks"}),
         {"ok": True},
     ]
 
-    await send(
-        MessageChain([Record(file=str(audio_path), text="Speech test.")])
-    )
+    await send(MessageChain([Record(file=str(audio_path), text="Speech test.")]))
 
     client.files_upload_v2.assert_awaited_once()
     assert client.chat_postMessage.await_count == 2
@@ -151,7 +148,7 @@ async def test_slack_tts_preserves_mixed_message_order(
     elif failure == "blocks":
         client.chat_postMessage.side_effect = [
             {"ok": True},
-            RuntimeError("blocks rejected"),
+            SlackApiError("Blocks rejected", {"error": "invalid_blocks"}),
             {"ok": True},
         ]
 
@@ -169,7 +166,8 @@ async def test_slack_tts_preserves_mixed_message_order(
     if failure == "blocks":
         expected_calls.append("chat_postMessage")
         assert client.chat_postMessage.await_args.kwargs == {
-            "channel": "C123", "text": "After."
+            "channel": "C123",
+            "text": "After.",
         }
     assert [call[0] for call in client.mock_calls] == expected_calls
     assert [

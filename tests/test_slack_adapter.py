@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlencode
 
 import pytest
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 
 from astrbot.api.message_components import (
     ActionRow,
@@ -72,15 +74,30 @@ async def test_slack_action_row_renders_block_kit_buttons():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fallback_text", [None, "Please approve"])
-async def test_slack_rejected_button_blocks_retry_readable_text(fallback_text):
-    client = AsyncMock()
-    client.chat_postMessage.side_effect = [
-        RuntimeError("blocks rejected"),
-        {"ok": True},
-    ]
+@pytest.mark.parametrize(
+    ("fallback_text", "failure"),
+    [
+        (None, "invalid_blocks"),
+        ("Please approve", "invalid_blocks_format"),
+        (None, "runtime"),
+        (None, "timeout"),
+    ],
+)
+async def test_slack_button_text_fallback_requires_format_rejection(
+    fallback_text, failure
+):
+    rejected = failure in {"invalid_blocks", "invalid_blocks_format"}
+    error = (
+        SlackApiError("blocks rejected", {"ok": False, "error": failure})
+        if rejected
+        else TimeoutError("response lost")
+        if failure == "timeout"
+        else RuntimeError("blocks rejected")
+    )
+    client = AsyncWebClient(token="xoxb-test")
+    client.api_call = AsyncMock(side_effect=[error, {"ok": True}])
 
-    await SlackMessageEvent._send_message(
+    send = SlackMessageEvent._send_message(
         MessageChain(
             [
                 Plain("Choose: "),
@@ -99,9 +116,20 @@ async def test_slack_rejected_button_blocks_retry_readable_text(fallback_text):
         client,
         "C1",
     )
+    if rejected:
+        await send
+    else:
+        with pytest.raises(type(error)) as raised:
+            await send
+        assert raised.value is error
 
-    assert client.chat_postMessage.await_count == 2
-    assert client.chat_postMessage.await_args.kwargs == {
+    calls = client.api_call.await_args_list
+    assert len(calls) == (2 if rejected else 1)
+    assert all(call.args == ("chat.postMessage",) for call in calls)
+    assert calls[0].kwargs["json"]["blocks"][1]["type"] == "actions"
+    if not rejected:
+        return
+    assert calls[-1].kwargs["json"] == {
         "channel": "C1",
         "text": "Choose: " + (fallback_text or "Approve"),
     }
