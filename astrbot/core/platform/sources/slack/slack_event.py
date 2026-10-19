@@ -449,9 +449,9 @@ class SlackMessageEvent(AstrMessageEvent):
             if external:
                 try:
                     await stream._flush(final=True)
-                except Exception as exc:
-                    # Tools may catch send errors; the consumer must still stop
-                    # rather than retry a flush with an unknown delivery outcome.
+                except (Exception, asyncio.CancelledError) as exc:
+                    # Tool timeouts cancel sends and may then let generation resume.
+                    # Stop the consumer too: the flush may already have arrived.
                     stream.error = exc
                     raise
             # RespondStage sends audio separately from the remaining dual-output text.

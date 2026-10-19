@@ -761,3 +761,53 @@ async def test_failed_direct_send_boundary_stops_even_if_tool_catches_error(stre
     assert not any("blocks" in call.kwargs["json"] for call in calls)
     assert sum(call.args[0] == "chat.update" for call in calls) == 1
     assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
+    messages = {}
+    accepted = False
+    generator_closed = asyncio.Event()
+
+    async def api(method, **kwargs):
+        nonlocal accepted
+        body = kwargs["json"]
+        ts = body.get("ts", str(len(messages) + 1))
+        if method in {"chat.startStream", "chat.postMessage", "chat.update"}:
+            messages[ts] = body.get("markdown_text", "[image]")
+        elif method == "chat.appendStream":
+            messages[ts] += body["markdown_text"]
+        if method in {"chat.update", "chat.appendStream"} and not accepted:
+            accepted = True
+            # Slack accepted the write, but the tool times out before its response.
+            await asyncio.Event().wait()
+        return {"ok": True, "ts": ts}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        try:
+            yield MessageChain([Plain("Before")])
+            yield MessageChain([Plain(" tool")])
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    stream.event.send(
+                        MessageChain([Image.fromURL("https://example.com/image.png")])
+                    ),
+                    timeout=0.02,
+                )
+            # The tool executor reports timeout and permits the model to continue.
+            yield MessageChain([Plain(" After")])
+        finally:
+            generator_closed.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stream.event.send_streaming(chunks())
+    assert messages == {"1": "Before tool"}
+    assert [call.args[0] for call in stream.api.await_args_list] == (
+        ["chat.startStream", "chat.appendStream", "chat.stopStream"]
+        if stream.native
+        else ["chat.postMessage", "chat.update"]
+    )
+    assert generator_closed.is_set()
+    assert stream.event._stream is None

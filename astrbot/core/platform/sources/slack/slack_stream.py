@@ -98,7 +98,7 @@ class SlackMessageStream:
         self.last_update = 0.0
         self.lock = asyncio.Lock()
         self.task = asyncio.current_task()
-        self.error: Exception | None = None
+        self.error: Exception | asyncio.CancelledError | None = None
 
     async def _flush(self, final: bool = False) -> None:
         """Publish accumulated text, sealing it at a content boundary.
