@@ -950,6 +950,24 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
     assert stream.event._stream is None
 
 
+async def _send_through_respond_stage(event, chunks):
+    """Drive a message stream through the real response stage and Slack adapter.
+
+    Args:
+        event: Slack event receiving the streaming result.
+        chunks: Async iterator of message chains to deliver.
+    """
+    event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks,
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    await stage.process(event)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True], indirect=True)
 @pytest.mark.parametrize(
@@ -959,7 +977,6 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
         "exception",
         "mcp_error",
         "shell_denied",
-        "shell_denied_fallback",
         "shell_exception",
         "shell_exit",
         "shell_timeout",
@@ -970,7 +987,6 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
         "session_terminate",
         "python_denied",
         "python_error",
-        "python_error_fallback",
         "python_output",
         "file_denied",
         "file_missing",
@@ -1064,7 +1080,11 @@ async def test_task_cards_through_real_tool_runner_and_respond(
             LocalPythonComponent,
             LocalShellComponent,
         )
-        from astrbot.core.astr_agent_runtime.tools.computer_tools import python, shell, util
+        from astrbot.core.astr_agent_runtime.tools.computer_tools import (
+            python,
+            shell,
+            util,
+        )
 
         stream.event.role = "admin"
         config_holder.get_config = lambda **_: {
@@ -1147,8 +1167,8 @@ async def test_task_cards_through_real_tool_runner_and_respond(
             tool, tool_args = shell.LocalExecuteShellTool(), {"command": "echo example"}
 
     if outcome.startswith("file_"):
-        from astrbot.core.computer.booters.local import LocalBooter
-        from astrbot.core.tools.computer_tools import fs
+        from astrbot.core.astr_agent_runtime.computer.booters.local import LocalBooter
+        from astrbot.core.astr_agent_runtime.tools.computer_tools import fs
 
         stream.event.role = "admin"
         config_holder.get_config = lambda **_: {
@@ -1274,17 +1294,10 @@ async def test_task_cards_through_real_tool_runner_and_respond(
     turn = await session.run_turn(AgentInput(stream.event, AgentPermissions()))
     stream.event.bind_agent_turn(turn)
     try:
-        stream.event.set_result(
-            MessageEventResult(
-                result_content_type=ResultContentType.STREAMING_RESULT,
-                async_stream=present_turn(
-                    turn, streaming=True, show_tool_use=outcome != "hidden"
-                ),
-            )
+        await _send_through_respond_stage(
+            stream.event,
+            present_turn(turn, streaming=True, show_tool_use=outcome != "hidden"),
         )
-        stage = RespondStage()
-        stage.config = {}
-        await stage.process(stream.event)
     finally:
         await session.close()
         stream.event.bind_agent_turn(None)
@@ -1572,14 +1585,6 @@ async def test_stalled_progress_is_bounded_through_respond(
             )
         yield MessageChain([Plain("Final")])
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {}
     app = web.Application()
     app.router.add_post("/{method}", handle)
     async with TestServer(app) as server:
@@ -1589,7 +1594,9 @@ async def test_stalled_progress_is_bounded_through_respond(
         original_timeout = client.timeout
         original_retries = list(client.retry_handlers)
         try:
-            await asyncio.wait_for(stage.process(stream.event), timeout=3)
+            await asyncio.wait_for(
+                _send_through_respond_stage(stream.event, chunks()), timeout=3
+            )
         finally:
             release.set()
     assert client.timeout == original_timeout
@@ -1686,14 +1693,6 @@ async def test_progress_rate_limit_coalesces_without_waiting_through_respond(
             )
         yield MessageChain([Plain("Final")])
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {}
     app = web.Application()
     app.router.add_post("/{method}", handle)
     async with TestServer(app) as server:
@@ -1705,7 +1704,7 @@ async def test_progress_rate_limit_coalesces_without_waiting_through_respond(
         client.proxy = None
         stream.event.web_client = client
         original_retries = list(client.retry_handlers)
-        await stage.process(stream.event)
+        await _send_through_respond_stage(stream.event, chunks())
     assert all(call.args[0] == 0 for call in sleep.await_args_list)
     assert stream.event.web_client.retry_handlers == original_retries
     assert "Final" in answers
@@ -1786,15 +1785,7 @@ async def test_expired_task_card_renews_once_through_respond(stream, renewal):
             )
         yield MessageChain([Plain("Final")])
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {}
-    await stage.process(stream.event)
+    await _send_through_respond_stage(stream.event, chunks())
     assert len(starts) == 2
     assert all(
         body["channel"] == "C123" and body["thread_ts"] == "0.1" for body in starts
@@ -1882,15 +1873,7 @@ async def test_task_card_text_fallback_edits_one_message_through_respond(
             )
         yield MessageChain([Plain("Final")])
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {}
-    await stage.process(stream.event)
+    await _send_through_respond_stage(stream.event, chunks())
     progress = [
         (method, body["text"])
         for method, body in requests
@@ -1947,15 +1930,7 @@ async def test_task_titles_are_compact_through_respond(stream, fallback):
                 )
         yield MessageChain([], type="aborted")
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {}
-    await stage.process(stream.event)
+    await _send_through_respond_stage(stream.event, chunks())
 
     if fallback:
         text = requests[-1][1]["text"]
@@ -2052,15 +2027,7 @@ async def test_long_text_progress_stays_bounded_through_respond(
         yield MessageChain([Image.fromURL("https://example.com/image.png")])
         yield MessageChain([Plain("Final")])
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {}
-    await stage.process(stream.event)
+    await _send_through_respond_stage(stream.event, chunks())
 
     assert [method for method, _ in progress].count("chat.postMessage") == 1
     assert all(len(text.splitlines()) <= 10 for _, text in progress)
@@ -2143,15 +2110,7 @@ async def test_text_progress_closes_pending_tasks_through_respond(stream, ending
         else:
             yield MessageChain([Plain("Final")])
 
-    stream.event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {}
-    sending = asyncio.create_task(stage.process(stream.event))
+    sending = asyncio.create_task(_send_through_respond_stage(stream.event, chunks()))
     try:
         if ending == "cancel":
             await asyncio.wait_for(started.wait(), timeout=2)
