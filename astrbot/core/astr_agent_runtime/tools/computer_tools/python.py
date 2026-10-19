@@ -21,6 +21,7 @@ from .fs import _read_allowed_roots, _write_allowed_roots
 from .util import (
     check_admin_permission,
     check_local_execution_permission,
+    execution_error_result,
     workspace_root_for_context,
 )
 
@@ -73,7 +74,7 @@ async def handle_result(
     images: list[dict] = output.get("images", [])
     text: str = output.get("text", "")
 
-    resp = mcp.types.CallToolResult(content=[])
+    resp = mcp.types.CallToolResult(content=[], isError=bool(error))
 
     if error:
         resp.content.append(mcp.types.TextContent(type="text", text=f"error: {error}"))
@@ -121,7 +122,7 @@ class PythonTool(FunctionTool):
         timeout: int = 30,
     ) -> ToolExecResult:
         if permission_error := check_admin_permission(context, "Python execution"):
-            return permission_error
+            return execution_error_result(permission_error)
         sb = await get_booter(
             context.context.context,
             context.context.event.unified_msg_origin,
@@ -139,7 +140,7 @@ class PythonTool(FunctionTool):
             )
             return await handle_result(result, context.context)
         except Exception as e:
-            return f"Error executing code: {str(e)}"
+            return execution_error_result(f"Error executing code: {str(e)}")
 
 
 @builtin_tool(config=_LOCAL_PYTHON_TOOL_CONFIG)
@@ -166,13 +167,17 @@ class LocalPythonTool(FunctionTool):
             "Python execution",
         )
         if permission_error:
-            return permission_error
+            return execution_error_result(permission_error)
         if local_policy is None:
-            return "Error executing code: only local runtime is supported."
+            return execution_error_result(
+                "Error executing code: only local runtime is supported."
+            )
         sandboxed = local_policy.requires_sandbox
         sb = get_local_booter()
         if not isinstance(sb.python, LocalPythonComponent):
-            return "Error executing code: local Python component is unavailable."
+            return execution_error_result(
+                "Error executing code: local Python component is unavailable."
+            )
         effective_timeout = (
             min(timeout, context.tool_call_timeout)
             if timeout > 0
@@ -207,4 +212,4 @@ class LocalPythonTool(FunctionTool):
             )
             return await handle_result(result, context.context)
         except Exception as e:
-            return f"Error executing code: {str(e)}"
+            return execution_error_result(f"Error executing code: {str(e)}")

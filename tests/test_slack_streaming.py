@@ -958,6 +958,20 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
         "success",
         "exception",
         "mcp_error",
+        "shell_denied",
+        "shell_denied_fallback",
+        "shell_exception",
+        "shell_exit",
+        "shell_timeout",
+        "shell_remote_exit",
+        "shell_output",
+        "session_denied",
+        "session_exit",
+        "session_terminate",
+        "python_denied",
+        "python_error",
+        "python_error_fallback",
+        "python_output",
         "timeout",
         "missing",
         "off",
@@ -968,7 +982,9 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
         "direct_lost",
     ],
 )
-async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
+async def test_task_cards_through_real_tool_runner_and_respond(
+    stream, outcome, monkeypatch, tmp_path
+):
     from mcp.types import CallToolResult, TextContent
 
     from astrbot.core.agent.hooks import BaseAgentRunHooks
@@ -978,6 +994,15 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
     from astrbot.core.astr_agent_runtime.tool_executor import FunctionToolExecutor
     from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
+    fallback = outcome.endswith("_fallback")
+    outcome = outcome.removesuffix("_fallback")
+    succeeded = outcome in {
+        "success",
+        "direct_success",
+        "shell_output",
+        "python_output",
+        "session_terminate",
+    }
     stream.event.native_task_cards = outcome != "off"
     enabled = outcome not in {"off", "hidden", "tts"}
     requests = []
@@ -985,6 +1010,8 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
     async def api(method, **kwargs):
         body = kwargs["json"]
         requests.append((method, body))
+        if fallback and body.get("task_display_mode") == "plan":
+            raise SlackApiError("unsupported cards", {"error": "invalid_arguments"})
         if "blocks" in body:
             if outcome == "direct_rejected":
                 raise SlackApiError("image rejected", {"error": "channel_not_found"})
@@ -1013,6 +1040,101 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
         await event.send(MessageChain([Image.fromURL("https://example.com/tool.png")]))
         return "success"
 
+    tool = FunctionTool(
+        name="probe",
+        description="probe",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+    )
+    tool_args = {}
+    config_holder = SimpleNamespace()
+    if outcome.startswith(("shell_", "python_", "session_")):
+        from astrbot.core.astr_agent_runtime.computer.booters.local import (
+            LocalPythonComponent,
+            LocalShellComponent,
+        )
+        from astrbot.core.astr_agent_runtime.tools.computer_tools import python, shell, util
+
+        stream.event.role = "admin"
+        config_holder.get_config = lambda **_: {
+            "provider_settings": {
+                "computer_use_runtime": "sandbox"
+                if outcome == "shell_remote_exit"
+                else "local",
+                "computer_use_local_permissions": {
+                    "admin": {
+                        "allow_execution": True,
+                        "allow_network": True,
+                        "filesystem_scope": "workspace"
+                        if outcome.endswith("denied")
+                        else "host",
+                    }
+                },
+            }
+        }
+        monkeypatch.setattr(
+            util,
+            "get_process_sandbox_status",
+            lambda: {
+                "status": "unavailable",
+                "backend": "bubblewrap",
+                "error": "namespace denied",
+            },
+        )
+        booter = SimpleNamespace(
+            shell=LocalShellComponent(), python=LocalPythonComponent()
+        )
+        booter.shell.exec_managed = AsyncMock(
+            return_value={
+                "session_closed": True,
+                "status": "failed" if outcome == "shell_exit" else "completed",
+                "exit_code": 1 if outcome == "shell_exit" else 0,
+                "stdout": "error: example text printed successfully",
+                "stderr": "",
+            }
+        )
+        booter.shell.exec = AsyncMock(
+            return_value={"exit_code": 1, "stdout": "", "stderr": "failed"}
+        )
+        booter.shell.poll_session = AsyncMock(
+            return_value={"exit_code": 1, "status": "failed"}
+        )
+        booter.shell.terminate_session = AsyncMock(
+            return_value={"exit_code": -15, "status": "terminated"}
+        )
+        if outcome == "shell_timeout":
+            booter.shell.exec_managed.return_value = {
+                "exit_code": 0,
+                "status": "timed_out",
+            }
+        if outcome == "shell_exception":
+            booter.shell.exec_managed.side_effect = RuntimeError("execution failed")
+        booter.python.exec = AsyncMock(
+            return_value={
+                "data": {
+                    "error": "execution failed" if outcome == "python_error" else "",
+                    "output": {"text": "error: example text printed successfully"},
+                }
+            }
+        )
+        monkeypatch.setattr(shell, "get_booter", AsyncMock(return_value=booter))
+        monkeypatch.setattr(python, "get_local_booter", lambda: booter)
+        monkeypatch.setattr(shell, "get_local_booter", lambda: booter)
+        for module in (shell, python):
+            monkeypatch.setattr(
+                module, "workspace_root_for_context", AsyncMock(return_value=tmp_path)
+            )
+        if outcome.startswith("python_"):
+            tool, tool_args = python.LocalPythonTool(), {"code": "print('example')"}
+        elif outcome.startswith("session_"):
+            tool = shell.ShellSessionTool()
+            tool_args = {
+                "action": "terminate" if outcome == "session_terminate" else "poll",
+                "session_id": "session",
+            }
+        else:
+            tool, tool_args = shell.LocalExecuteShellTool(), {"command": "echo example"}
+
     calls = 0
 
     async def model(**kwargs):
@@ -1023,31 +1145,24 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
             yield LLMResponse(
                 role="assistant",
                 completion_text="Before",
-                tools_call_name=["missing" if outcome == "missing" else "probe"],
-                tools_call_args=[{}],
+                tools_call_name=["missing" if outcome == "missing" else tool.name],
+                tools_call_args=[tool_args],
                 tools_call_ids=["call-probe"],
             )
         else:
             yield LLMResponse(role="assistant", completion_text="Final", is_chunk=True)
             yield LLMResponse(role="assistant", completion_text="Final")
 
-    context = ContextWrapper(context=SimpleNamespace(event=stream.event))
+    context = ContextWrapper(
+        context=SimpleNamespace(event=stream.event, context=config_holder)
+    )
     context.tool_call_timeout = 0.02 if outcome == "timeout" else 5
     runner = ToolLoopAgentRunner()
     await runner.reset(
         provider=SimpleNamespace(provider_config={}, text_chat_stream=model, get_model=lambda: "offline"),
         request=ProviderRequest(
             prompt="probe",
-            func_tool=ToolSet(
-                tools=[
-                    FunctionTool(
-                        name="probe",
-                        description="probe",
-                        parameters={"type": "object", "properties": {}},
-                        handler=handler,
-                    )
-                ]
-            ),
+            func_tool=ToolSet(tools=[tool]),
         ),
         run_context=context,
         tool_executor=FunctionToolExecutor(),
@@ -1087,7 +1202,17 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
         body for method, body in requests if body.get("task_display_mode") == "plan"
     ]
     assert len(starts) == int(enabled)
-    if enabled:
+    if fallback:
+        progress = [
+            body["text"]
+            for _, body in requests
+            if body.get("text", "").startswith("AstrBot 工具进度")
+        ]
+        assert progress == [
+            f"AstrBot 工具进度\n• {tool.name}：进行中",
+            f"AstrBot 工具进度\n• {tool.name}：失败",
+        ]
+    elif enabled:
         updates = [
             chunk
             for _, body in requests
@@ -1096,9 +1221,29 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
         ]
         assert [chunk["status"] for chunk in updates] == [
             "in_progress",
-            "complete" if outcome in {"success", "direct_success"} else "error",
+            "complete" if succeeded else "error",
         ]
         assert len({chunk["id"] for chunk in updates}) == 1
+    if outcome.startswith(("shell_", "python_", "session_")):
+        results = [m for m in runner.run_context.messages if m.role == "tool"]
+        assert len(results) == 1
+        expected_text = (
+            "namespace denied"
+            if outcome.endswith("denied")
+            else "execution failed"
+            if outcome in {"shell_exception", "python_error"}
+            else "exit code 1"
+            if outcome == "shell_exit"
+            else "timed_out"
+            if outcome == "shell_timeout"
+            else "failed"
+            if outcome in {"shell_remote_exit", "session_exit"}
+            else "terminated"
+            if outcome == "session_terminate"
+            else "error: example text printed successfully"
+        )
+        assert expected_text in str(results[0].content)
+        assert calls == 2
     if outcome.startswith("direct_"):
         assert calls == 1  # Direct delivery still ends the loop, even on failure.
         assert sum("blocks" in body for _, body in requests) == 1
@@ -1273,7 +1418,9 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
 @pytest.mark.parametrize(
     "stalled", ["start", "append", "stop", "text_post", "text_update", "text_close"]
 )
-async def test_stalled_progress_is_bounded_through_respond(stream, monkeypatch, stalled):
+async def test_stalled_progress_is_bounded_through_respond(
+    stream, monkeypatch, stalled
+):
     stream.event.native_task_cards = True
     progress_logger = Mock()
     monkeypatch.setattr(
@@ -1366,7 +1513,9 @@ async def test_stalled_progress_is_bounded_through_respond(stream, monkeypatch, 
     ) == int(text_mode)
     media = next(i for i, (_, body) in enumerate(requests) if "blocks" in body)
     final = next(
-        i for i, (_, body) in enumerate(requests) if body.get("markdown_text") == "Final"
+        i
+        for i, (_, body) in enumerate(requests)
+        if body.get("markdown_text") == "Final"
     )
     assert media < final
     assert stream.event._stream is None

@@ -3,6 +3,7 @@ import base64
 import re
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, cast
 
 import aiohttp
@@ -82,6 +83,8 @@ class SlackAdapter(Platform):
         self.webhook_client = None
 
         self.bot_self_id = None
+        self._pending_event_ids: set[str] = set()
+        self._seen_event_ids: OrderedDict[str, float] = OrderedDict()
 
     async def send_by_session(
         self,
@@ -403,24 +406,7 @@ class SlackAdapter(Platform):
             return
 
         if req.type == "events_api":
-            # 事件 API
-            event = req.payload.get("event", {})
-
-            # 忽略机器人自己的消息和消息编辑
-            if event.get("subtype") in [
-                "bot_message",
-                "message_changed",
-                "message_deleted",
-            ]:
-                return
-
-            if event.get("bot_id"):
-                return
-
-            if event.get("type") in ["message", "app_mention"]:
-                abm = await self.convert_message(event)
-                if abm:
-                    await self.handle_msg(abm)
+            await self._handle_webhook_event(req.payload)
 
     async def get_bot_user_id(self):
         auth_info = await self.web_client.auth_test()
@@ -490,7 +476,11 @@ class SlackAdapter(Platform):
             )
 
     async def _handle_webhook_event(self, event_data: dict) -> None:
-        """处理 Webhook 事件"""
+        """Convert and enqueue an Events API delivery from either transport.
+
+        Args:
+            event_data: Slack payload containing the event and its stable event ID.
+        """
         if event_data.get("type") == "block_actions":
             abm = await self.convert_button_interaction(event_data)
             if abm:
@@ -511,9 +501,36 @@ class SlackAdapter(Platform):
             return
 
         if event.get("type") in ["message", "app_mention"]:
-            abm = await self.convert_message(event)
-            if abm:
-                await self.handle_msg(abm)
+            # Reserve before the first await so concurrent deliveries cannot enqueue twice.
+            event_id = event_data.get("event_id")
+            if not isinstance(event_id, str):
+                event_id = None
+            # Keep up to 10,000 completed IDs for ten minutes; pending IDs do not expire.
+            now = time.monotonic()
+            while self._seen_event_ids:
+                _, seen_at = next(iter(self._seen_event_ids.items()))
+                if now - seen_at < 600:
+                    break
+                self._seen_event_ids.popitem(last=False)
+            if event_id:
+                if (
+                    event_id in self._pending_event_ids
+                    or event_id in self._seen_event_ids
+                ):
+                    return
+                self._pending_event_ids.add(event_id)
+            try:
+                abm = await self.convert_message(event)
+                if abm:
+                    await self.handle_msg(abm)
+                    if event_id:
+                        self._seen_event_ids[event_id] = time.monotonic()
+                        if len(self._seen_event_ids) > 10_000:
+                            self._seen_event_ids.popitem(last=False)
+            finally:
+                # Failed conversion/enqueue remains retryable, including cancellation.
+                if event_id:
+                    self._pending_event_ids.discard(event_id)
 
     async def webhook_callback(self, request: Any) -> Any:
         """统一 Webhook 回调入口"""

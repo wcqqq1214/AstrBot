@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from mcp.types import CallToolResult, TextContent
+
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.runtime import get_agent_permissions
 from astrbot.core.astr_agent_runtime.computer.process_sandbox import (
@@ -23,6 +25,20 @@ LOCAL_NETWORK_POLICY_NOTICE = (
     "HTTP/HTTPS, or disabled certificate verification; these do not change the policy. "
     "Local offline operations are still allowed."
 )
+
+
+def execution_error_result(message: str) -> CallToolResult:
+    """Preserve an execution error's text and expose its failure status.
+
+    Args:
+        message: Error text to return to the model.
+
+    Returns:
+        Structured tool failure consumed by the runner and progress display.
+    """
+    return CallToolResult(
+        isError=True, content=[TextContent(type="text", text=message)]
+    )
 
 
 @dataclass(frozen=True)

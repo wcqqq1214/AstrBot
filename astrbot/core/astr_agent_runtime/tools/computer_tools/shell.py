@@ -23,6 +23,7 @@ from ..registry import builtin_tool
 from .fs import _read_allowed_roots, _write_allowed_roots
 from .util import (
     check_local_execution_permission,
+    execution_error_result,
     get_local_permission_policy,
     is_local_runtime,
     workspace_root_for_context,
@@ -110,7 +111,7 @@ class ExecuteShellTool(FunctionTool):
             "Shell execution",
         )
         if permission_error:
-            return permission_error
+            return execution_error_result(permission_error)
         sandboxed = bool(local_policy and local_policy.requires_sandbox)
 
         sb = await get_booter(
@@ -128,12 +129,14 @@ class ExecuteShellTool(FunctionTool):
             env = dict(env or {})
             if local_runtime:
                 if not isinstance(sb.shell, LocalShellComponent):
-                    return (
+                    return execution_error_result(
                         "Error executing command: local shell component is unavailable."
                     )
                 creator_id = context.context.event.get_sender_id()
                 if not creator_id:
-                    return "Error executing command: sender identity is unavailable."
+                    return execution_error_result(
+                        "Error executing command: sender identity is unavailable."
+                    )
                 creator_is_admin = get_agent_permissions(context).role == "admin"
                 sandbox_roots = {}
                 if local_policy and local_policy.filesystem_scope == "workspace":
@@ -190,8 +193,16 @@ class ExecuteShellTool(FunctionTool):
                         f"(wall time: {elapsed_seconds:.2f}s)."
                     )
                     output = f"{result['stdout']}{result['stderr']}"
-                    return f"{message}\nOutput:\n{output}"
-                return json.dumps(result, ensure_ascii=False)
+                    text = f"{message}\nOutput:\n{output}"
+                    return execution_error_result(text) if result["exit_code"] else text
+                text = json.dumps(result, ensure_ascii=False)
+                if result.get("exit_code") not in (None, 0) or result.get("status") in {
+                    "failed",
+                    "timed_out",
+                    "output_limited",
+                }:
+                    return execution_error_result(text)
+                return text
 
             effective_background = background and not _is_self_detached_command(command)
 
@@ -218,10 +229,17 @@ class ExecuteShellTool(FunctionTool):
                     f"Command is running in the background. stdout/stderr is being "
                     f"written to `{stdout_file}`. Use astrbot_file_read_tool to read it."
                 )
-            return json.dumps(result, ensure_ascii=False)
+            text = json.dumps(result, ensure_ascii=False)
+            if result.get("exit_code") not in (None, 0) or result.get("status") in {
+                "failed",
+                "timed_out",
+                "output_limited",
+            }:
+                return execution_error_result(text)
+            return text
         except Exception as e:
             detail = str(e) or type(e).__name__
-            return f"Error executing command: {detail}"
+            return execution_error_result(f"Error executing command: {detail}")
 
 
 @dataclass
@@ -388,19 +406,25 @@ class ShellSessionTool(FunctionTool):
             "Shell session management",
         )
         if permission_error and action != "terminate":
-            return permission_error
+            return execution_error_result(permission_error)
         if not is_local_runtime(context) and action != "terminate":
-            return "Error managing shell session: only local runtime is supported."
+            return execution_error_result(
+                "Error managing shell session: only local runtime is supported."
+            )
 
         try:
             sb = get_local_booter()
             if not isinstance(sb.shell, LocalShellComponent):
-                return "Error managing shell session: local shell component is unavailable."
+                return execution_error_result(
+                    "Error managing shell session: local shell component is unavailable."
+                )
 
             owner_id = context.context.event.unified_msg_origin
             requester_id = context.context.event.get_sender_id()
             if not requester_id:
-                return "Error managing shell session: sender identity is unavailable."
+                return execution_error_result(
+                    "Error managing shell session: sender identity is unavailable."
+                )
             requester_is_admin = get_agent_permissions(context).role == "admin"
             if action == "list":
                 result = await sb.shell.list_sessions(
@@ -410,7 +434,7 @@ class ShellSessionTool(FunctionTool):
                 )
             else:
                 if not session_id:
-                    return (
+                    return execution_error_result(
                         "Error managing shell session: session_id is required "
                         f"when action={action}."
                     )
@@ -466,11 +490,20 @@ class ShellSessionTool(FunctionTool):
                         max_output_chars=max_output_chars,
                     )
                 else:
-                    return f"Error managing shell session: unsupported action {action}."
-            return json.dumps(result, ensure_ascii=False)
+                    return execution_error_result(
+                        f"Error managing shell session: unsupported action {action}."
+                    )
+            text = json.dumps(result, ensure_ascii=False)
+            # An intentional stop can succeed even when the process exits nonzero.
+            if action not in {"terminate", "interrupt"} and (
+                result.get("exit_code") not in (None, 0)
+                or result.get("status") in {"failed", "timed_out", "output_limited"}
+            ):
+                return execution_error_result(text)
+            return text
         except Exception as exc:
             detail = str(exc) or type(exc).__name__
-            return f"Error managing shell session: {detail}"
+            return execution_error_result(f"Error managing shell session: {detail}")
 
 
 def _is_self_detached_command(command: str) -> bool:

@@ -75,7 +75,8 @@ async def test_local_python_tool_rejects_nonlocal_runtime(
 
     get_local_booter.assert_not_called()
     workspace_root.assert_not_awaited()
-    assert result == "Error executing code: only local runtime is supported."
+    assert result.isError is True
+    assert result.content[0].text == "Error executing code: only local runtime is supported."
 
 
 @pytest.mark.asyncio
@@ -195,6 +196,7 @@ async def test_local_python_uses_sandbox_backend(
     )
 
     result = await LocalPythonTool().call(context, code="print('ok')", timeout=30)
+    assert result.isError is True
     output = [part.text for part in result.content]
     assert output == ["error: execution failed", "ok"]
 
@@ -212,7 +214,8 @@ async def test_local_python_uses_sandbox_backend(
 
     python_exec.side_effect = RuntimeError("execution failed")
     result = await LocalPythonTool().call(context, code="print('ok')")
-    assert result == "Error executing code: execution failed"
+    assert result.isError is True
+    assert result.content[0].text == "Error executing code: execution failed"
 
 
 @pytest.mark.asyncio
@@ -255,6 +258,8 @@ async def test_local_member_python_is_denied_without_supported_sandbox(monkeypat
 
     result = await LocalPythonTool().call(context, code="print('ok')")
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "Local isolation unavailable" in result
     assert "not supported on this platform" in result
     assert "Python execution was blocked" in result

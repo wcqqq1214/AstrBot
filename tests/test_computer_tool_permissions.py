@@ -219,6 +219,9 @@ async def test_none_scope_denies_all_local_tools_before_accessing_resources(
 
     result = await tool().call(context, **kwargs)
 
+    if tool in {shell.LocalExecuteShellTool, shell.ShellSessionTool, python.LocalPythonTool}:
+        assert result.isError is True
+        result = result.content[0].text
     assert "Permission denied" in result
     assert "Local Permission Policies" in result
     booter.assert_not_called()
@@ -303,6 +306,8 @@ async def test_member_denial_offers_only_available_administrator_access(
 
     result = await tool().call(context, **kwargs)
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "disabled by the Local permission policy" in result
     assert "Ask an AstrBot administrator" in result
     assert "Execute code" in result
@@ -441,6 +446,8 @@ async def test_isolation_failure_is_explained_to_llm_before_starting_tools(
 
     result = await tool().call(context, **kwargs)
 
+    assert result.isError is True
+    result = result.content[0].text
     assert result.startswith("error: Local isolation unavailable.")
     assert detail in result
     assert "runtime is the local environment (`local`)" in result
@@ -499,6 +506,8 @@ async def test_sandbox_launch_failure_never_retries_without_isolation(
     else:
         result = await python.LocalPythonTool().call(context, code="print('forbidden')")
 
+    assert result.isError is True
+    result = result.content[0].text
     assert result.startswith("Error executing")
     assert "Isolation backend stopped working" in result
     factory.assert_called_once()
@@ -537,7 +546,8 @@ async def test_default_execution_does_not_require_isolation(
         else:
             result = await python.LocalPythonTool().call(context, code="print('legacy-fallback')")
         if role == "member":
-            assert "Permission denied" in result
+            assert result.isError is True
+            assert "Permission denied" in result.content[0].text
             workspace.assert_not_called()
             get_booter.assert_not_called()
         else:
