@@ -2,6 +2,7 @@ from functools import partial
 from unittest.mock import AsyncMock
 
 import pytest
+from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
 from astrbot.api.event import AstrMessageEvent, MessageChain
@@ -138,8 +139,9 @@ async def test_slack_empty_text_is_not_sent(slack_event, content, quoted):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quoted", [False, True])
-@pytest.mark.parametrize("slack_sender", ["event", "respond", "session"], indirect=True)
-async def test_slack_mixed_image_reply_keeps_blocks(slack_event, slack_sender, quoted):
+async def test_slack_mixed_image_reply_preserves_markdown_order(
+    slack_event, slack_sender, quoted
+):
     chain = [
         Plain("- Before\n  - Nested"),
         Image.fromURL("https://example.com/image.png"),
@@ -153,18 +155,18 @@ async def test_slack_mixed_image_reply_keeps_blocks(slack_event, slack_sender, q
         "chat.postMessage",
         json={
             "channel": "C123",
-            "text": "",
+            "text": "- Before\n  - Nested\n\n[图片]\n\nAfter.",
             "blocks": [
                 {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": "- Before\n  - Nested"},
+                    "type": "markdown",
+                    "text": "- Before\n  - Nested",
                 },
                 {
                     "type": "image",
                     "image_url": "https://example.com/image.png",
                     "alt_text": "图片",
                 },
-                {"type": "section", "text": {"type": "mrkdwn", "text": "After."}},
+                {"type": "markdown", "text": "After."},
             ],
         },
     )
@@ -189,3 +191,132 @@ async def test_slack_markdown_timeout_does_not_resend(slack_event):
         await slack_event.send(MessageChain([Plain("- First\n- Second")]))
 
     slack_event.web_client.api_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "invalid_blocks",
+        "invalid_blocks_format",
+        "msg_blocks_too_long",
+        "msg_too_long",
+        "too_many_blocks",
+    ],
+)
+async def test_slack_mixed_markdown_rejection_reuses_uploaded_image(
+    slack_event, tmp_path, error_code
+):
+    path = tmp_path / "image.png"
+    path.write_bytes(b"test image")
+    client = slack_event.web_client
+    client.files_upload_v2 = AsyncMock(
+        return_value={
+            "ok": True,
+            "files": [{"url_private": "https://slack.test/image.png"}],
+        }
+    )
+    client.api_call.side_effect = [
+        SlackApiError("Rejected blocks", {"ok": False, "error": error_code}),
+        {"ok": True},
+    ]
+
+    await slack_event.send(
+        MessageChain(
+            [
+                Plain("- Before\n  - Child"),
+                Image.fromFileSystem(str(path)),
+                Plain("After."),
+            ]
+        )
+    )
+
+    client.files_upload_v2.assert_awaited_once()
+    assert client.api_call.await_count == 2
+    native, fallback = [call.kwargs["json"] for call in client.api_call.await_args_list]
+    assert [block["type"] for block in native["blocks"]] == [
+        "markdown",
+        "image",
+        "markdown",
+    ]
+    assert fallback == {
+        "channel": "C123",
+        "text": "",
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "- Before\n  - Child"},
+            },
+            native["blocks"][1],
+            {"type": "section", "text": {"type": "mrkdwn", "text": "After."}},
+        ],
+    }
+    assert native["blocks"][1]["slack_file"]["url"] == "https://slack.test/image.png"
+    assert path.read_bytes() == b"test image"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code", [None, "ratelimited", "invalid_auth", "service_unavailable"]
+)
+async def test_slack_mixed_markdown_does_not_retry_other_errors(
+    slack_event, error_code
+):
+    error = (
+        SlackApiError("Send failed", {"ok": False, "error": error_code})
+        if error_code
+        else TimeoutError("Response timed out")
+    )
+    slack_event.web_client.api_call.side_effect = error
+
+    with pytest.raises(type(error)):
+        await slack_event.send(
+            MessageChain(
+                [Plain("- First"), Image.fromURL("https://example.com/image.png")]
+            )
+        )
+
+    slack_event.web_client.api_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [12_000, 12_001])
+async def test_slack_mixed_markdown_limit_is_cumulative(slack_event, length):
+    before = "a" * 6_000
+    after = "b" * (length - len(before))
+    await slack_event.send(
+        MessageChain(
+            [
+                Plain(before),
+                Image.fromURL("https://example.com/image.png"),
+                Plain(after),
+            ]
+        )
+    )
+
+    slack_event.web_client.api_call.assert_awaited_once()
+    blocks = slack_event.web_client.api_call.await_args.kwargs["json"]["blocks"]
+    text_type = "markdown" if length == 12_000 else "section"
+    assert [block["type"] for block in blocks] == [text_type, "image", text_type]
+    if length == 12_000:
+        assert [blocks[0]["text"], blocks[2]["text"]] == [before, after]
+    else:
+        assert [blocks[0]["text"]["text"], blocks[2]["text"]["text"]] == [before, after]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_mention", [False, True])
+async def test_slack_image_only_and_mention_keep_legacy_blocks(
+    slack_event, with_mention
+):
+    chain = [Image.fromURL("https://example.com/image.png")]
+    if with_mention:
+        chain[:0] = [At(qq="U456"), Plain("- First")]
+    await slack_event.send(MessageChain(chain))
+
+    slack_event.web_client.api_call.assert_awaited_once()
+    payload = slack_event.web_client.api_call.await_args.kwargs["json"]
+    assert "markdown_text" not in payload
+    assert [block["type"] for block in payload["blocks"]] == (
+        ["section", "image"] if with_mention else ["image"]
+    )

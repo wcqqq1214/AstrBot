@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
+from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
 from astrbot.api import logger
@@ -249,7 +250,7 @@ class SlackMessageEvent(AstrMessageEvent):
         channel_id: str,
         plain_texts: set[str] | None = None,
     ) -> None:
-        """Send plain Markdown or mixed blocks with the existing text retry.
+        """Send native Markdown text or image messages with a legacy block fallback.
 
         Args:
             message: Message components in delivery order.
@@ -297,6 +298,46 @@ class SlackMessageEvent(AstrMessageEvent):
             )
             if not blocks and not text.strip():
                 continue
+
+            # Reuse uploaded images if Slack rejects native Markdown blocks.
+            if any(block["type"] == "image" for block in blocks) and all(
+                isinstance(segment, (Plain, Reply, Image)) for segment in chain.chain
+            ):
+                markdown_length = sum(
+                    len(block["text"]["text"])
+                    for block in blocks
+                    if block["type"] == "section"
+                )
+                if 0 < markdown_length <= 12_000:
+                    markdown_blocks = [
+                        {"type": "markdown", "text": block["text"]["text"]}
+                        if block["type"] == "section"
+                        else block
+                        for block in blocks
+                    ]
+                    fallback_text = "\n\n".join(
+                        block["text"]
+                        if block["type"] == "markdown"
+                        else f"[{block['alt_text']}]"
+                        for block in markdown_blocks
+                    )
+                    try:
+                        await web_client.chat_postMessage(
+                            channel=channel_id,
+                            text=fallback_text,
+                            blocks=markdown_blocks,
+                        )
+                    except SlackApiError as error:
+                        if error.response.get("error") not in {
+                            "invalid_blocks",
+                            "invalid_blocks_format",
+                            "msg_blocks_too_long",
+                            "msg_too_long",
+                            "too_many_blocks",
+                        }:
+                            raise
+                    else:
+                        continue
 
             try:
                 await web_client.chat_postMessage(
@@ -360,7 +401,6 @@ class SlackMessageEvent(AstrMessageEvent):
                     buffer.chain.extend(chain.chain)
             if not buffer:
                 return None
-            buffer.squash_plain()
             await self.send(buffer)
             return await super().send_streaming(generator, use_fallback)
 
