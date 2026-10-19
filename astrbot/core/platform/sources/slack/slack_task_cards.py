@@ -6,7 +6,7 @@ from slack_sdk.errors import SlackApiError
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Json, Plain
+from astrbot.api.message_components import Json
 
 from .slack_stream import slack_api_request
 
@@ -27,6 +27,7 @@ class SlackTaskCards:
         self.tasks: dict[str, dict] = {}
         self.disabled = False
         self.fallback = False
+        self.fallback_ts: str | None = None
 
     async def update(self, chain: MessageChain) -> None:
         """Apply a structured tool start or result without exposing tool arguments.
@@ -123,15 +124,31 @@ class SlackTaskCards:
                 )
                 await self.close()
         if self.fallback:
-            status = {
-                "in_progress": "调用工具",
-                "complete": "工具完成",
-                "error": "工具失败",
-            }[task["status"]]
+            statuses = {
+                "in_progress": "进行中",
+                "complete": "已完成",
+                "error": "失败",
+            }
+            tasks = {**self.tasks, task_id: task}
+            text = "AstrBot 工具进度\n" + "\n".join(
+                f"• {item['title']}：{statuses[item['status']]}"
+                for item in tasks.values()
+            )
             try:
-                await self.event.send(
-                    MessageChain([Plain(f"{status}: {task['title']}")])
+                response = await slack_api_request(
+                    client,
+                    "chat_update" if self.fallback_ts else "chat_postMessage",
+                    channel=raw["channel"],
+                    **(
+                        {"ts": self.fallback_ts}
+                        if self.fallback_ts
+                        else {"thread_ts": raw["thread_ts"]}
+                    ),
+                    text=text,
+                    parse="full",
                 )
+                self.fallback_ts = response["ts"]
+                self.tasks[task_id] = task
             except Exception:
                 self.disabled = True
                 logger.warning("Slack task progress fallback failed.", exc_info=True)

@@ -1151,11 +1151,12 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
     assert any(body.get("markdown_text") == "Final" for _, body in requests)
     if failure == "start_lost":
         assert not any(
-            body.get("markdown_text", "").startswith("调用工具") for _, body in requests
+            body.get("text", "").startswith("AstrBot 工具进度") for _, body in requests
         )
     if failure == "rejected":
         assert any(
-            body.get("markdown_text") == "调用工具: probe" for _, body in requests
+            body.get("text") == "AstrBot 工具进度\n• probe：进行中"
+            for _, body in requests
         )
     if failure == "append_lost":
         updates = [
@@ -1237,14 +1238,16 @@ async def test_expired_task_card_renews_once_through_respond(stream, renewal):
     ]
     assert any(body.get("markdown_text") == "Final" for _, body in requests)
     fallback = [
-        body["markdown_text"]
+        body["text"]
         for _, body in requests
-        if body.get("markdown_text", "").startswith(
-            ("调用工具:", "工具完成:", "工具失败:")
-        )
+        if body.get("text", "").startswith("AstrBot 工具进度")
     ]
     assert fallback == (
-        ["工具失败: second", "调用工具: third", "工具完成: third"]
+        [
+            "AstrBot 工具进度\n• first：已完成\n• second：失败",
+            "AstrBot 工具进度\n• first：已完成\n• second：失败\n• third：进行中",
+            "AstrBot 工具进度\n• first：已完成\n• second：失败\n• third：已完成",
+        ]
         if renewal not in {"success", "lost"}
         else []
     )
@@ -1260,6 +1263,86 @@ async def test_expired_task_card_renews_once_through_respond(stream, renewal):
         if method == "chat.stopStream" and body["ts"].startswith("card-")
     ]
     assert stopped_cards == (["card-2"] if renewal == "success" else [])
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize(
+    "failure", [None, "post_lost", "update_lost", "update_rejected"]
+)
+async def test_task_card_text_fallback_edits_one_message_through_respond(
+    stream, failure
+):
+    stream.event.native_task_cards = True
+    requests = []
+    visible_text = {}
+
+    async def api(method, **kwargs):
+        body = kwargs["json"]
+        requests.append((method, body))
+        if body.get("task_display_mode") == "plan":
+            raise SlackApiError("cards unavailable", {"error": "invalid_arguments"})
+        if body.get("text", "").startswith("AstrBot 工具进度"):
+            assert body["channel"] == "C123" and body["parse"] == "full"
+            if method == "chat.postMessage":
+                assert body["thread_ts"] == "0.1"
+            else:
+                assert method == "chat.update" and body["ts"] == "progress"
+                assert "thread_ts" not in body
+                if failure == "update_rejected":
+                    raise SlackApiError(
+                        "message deleted", {"error": "message_not_found"}
+                    )
+            visible_text["progress"] = body["text"]
+            if (method == "chat.postMessage" and failure == "post_lost") or (
+                method == "chat.update" and failure == "update_lost"
+            ):
+                raise TimeoutError("write accepted but response lost")
+            return {"ok": True, "ts": "progress"}
+        return {"ok": True, "ts": body.get("ts", "answer")}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        for task_id in ("first", "second"):
+            yield MessageChain(
+                [Json(data={"id": task_id, "name": "same_tool"})], type="tool_call"
+            )
+            yield MessageChain(
+                [Json(data={"id": task_id, "is_error": task_id == "second"})],
+                type="tool_call_result",
+            )
+        yield MessageChain([Plain("Final")])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    await stage.process(stream.event)
+    progress = [
+        (method, body["text"])
+        for method, body in requests
+        if body.get("text", "").startswith("AstrBot 工具进度")
+    ]
+    expected = [
+        ("chat.postMessage", "AstrBot 工具进度\n• same_tool：进行中"),
+        ("chat.update", "AstrBot 工具进度\n• same_tool：已完成"),
+        ("chat.update", "AstrBot 工具进度\n• same_tool：已完成\n• same_tool：进行中"),
+        ("chat.update", "AstrBot 工具进度\n• same_tool：已完成\n• same_tool：失败"),
+    ]
+    assert progress == expected[: 1 if failure == "post_lost" else 2 if failure else 4]
+    assert visible_text == {
+        "progress": expected[
+            0 if failure in {"post_lost", "update_rejected"} else 1 if failure else 3
+        ][1]
+    }
+    assert sum(bool(body.get("task_display_mode")) for _, body in requests) == 1
+    assert any(body.get("markdown_text") == "Final" for _, body in requests)
     assert stream.event._stream is None
 
 

@@ -102,7 +102,9 @@ timeouts, and explicit tool errors produce an error status; interrupted tasks ar
 not marked complete. Background tools are complete when submission returns, not
 when their background work finishes.
 
-Explicit Slack capability or format rejections fall back to text progress. Other
+Explicit Slack capability or format rejections fall back to one text progress
+message, edited as tasks start and finish. If posting or editing that message
+fails, progress updates stop without reposting or suppressing the answer. Other
 delivery failures disable card updates for that reply without retrying uncertain
 writes or suppressing the answer. When Slack explicitly reports that a card stream
 is closed, AstrBot attempts to open a new card in the same thread with the current
