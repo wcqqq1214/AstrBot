@@ -104,8 +104,10 @@ when their background work finishes.
 
 Explicit Slack capability or format rejections fall back to text progress. Other
 delivery failures disable card updates for that reply without retrying uncertain
-writes or suppressing the answer. An expired card stream falls back to text;
-automatic card reopening is not implemented.
+writes or suppressing the answer. When Slack explicitly reports that a card stream
+is closed, AstrBot attempts to open a new card in the same thread with the current
+task states, once per update. The old card remains visible. If reopening fails,
+the same fallback rules apply.
 
 ## Test the Connection
 

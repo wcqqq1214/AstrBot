@@ -1175,6 +1175,96 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize(
+    "renewal",
+    ["success", "invalid_arguments", "message_not_in_streaming_state", "lost"],
+)
+async def test_expired_task_card_renews_once_through_respond(stream, renewal):
+    stream.event.native_task_cards = True
+    requests = []
+    starts = []
+
+    async def api(method, **kwargs):
+        body = kwargs["json"]
+        requests.append((method, body))
+        if body.get("task_display_mode") == "plan":
+            starts.append(body)
+            if len(starts) == 2:
+                if renewal == "lost":
+                    raise TimeoutError("renewed card accepted but response lost")
+                if renewal != "success":
+                    raise SlackApiError("renewal rejected", {"error": renewal})
+            return {"ok": True, "ts": f"card-{len(starts)}"}
+        if (
+            method == "chat.appendStream"
+            and body["ts"] == "card-1"
+            and body["chunks"][0]["status"] == "error"
+        ):
+            raise SlackApiError(
+                "card expired", {"error": "message_not_in_streaming_state"}
+            )
+        return {"ok": True, "ts": body.get("ts", "answer")}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        for task_id in ("first", "second", "third"):
+            yield MessageChain(
+                [Json(data={"id": task_id, "name": task_id})], type="tool_call"
+            )
+            yield MessageChain(
+                [Json(data={"id": task_id, "is_error": task_id == "second"})],
+                type="tool_call_result",
+            )
+        yield MessageChain([Plain("Final")])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    await stage.process(stream.event)
+    assert len(starts) == 2
+    assert all(
+        body["channel"] == "C123" and body["thread_ts"] == "0.1" for body in starts
+    )
+    assert [(task["id"], task["status"]) for task in starts[1]["chunks"][1:]] == [
+        ("first", "complete"),
+        ("second", "error"),
+    ]
+    assert any(body.get("markdown_text") == "Final" for _, body in requests)
+    fallback = [
+        body["markdown_text"]
+        for _, body in requests
+        if body.get("markdown_text", "").startswith(
+            ("调用工具:", "工具完成:", "工具失败:")
+        )
+    ]
+    assert fallback == (
+        ["工具失败: second", "调用工具: third", "工具完成: third"]
+        if renewal not in {"success", "lost"}
+        else []
+    )
+    updates = [
+        body["chunks"][0]["status"]
+        for method, body in requests
+        if method == "chat.appendStream" and body["ts"] == "card-2"
+    ]
+    assert updates == (["in_progress", "complete"] if renewal == "success" else [])
+    stopped_cards = [
+        body["ts"]
+        for method, body in requests
+        if method == "chat.stopStream" and body["ts"].startswith("card-")
+    ]
+    assert stopped_cards == (["card-2"] if renewal == "success" else [])
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
 async def test_cancelled_task_card_is_not_marked_complete(stream):
     stream.event.native_task_cards = True
 

@@ -60,6 +60,24 @@ class SlackTaskCards:
         client = self.event.web_client
         if not self.fallback:
             try:
+                if self.ts is not None:
+                    try:
+                        await slack_api_request(
+                            client,
+                            "chat_appendStream",
+                            channel=raw["channel"],
+                            ts=self.ts,
+                            chunks=[task],
+                        )
+                    except SlackApiError as exc:
+                        if (
+                            exc.response.get("error")
+                            != "message_not_in_streaming_state"
+                        ):
+                            raise
+                        # Slack confirmed the old card is sealed. Reopen once with
+                        # the full state; uncertain writes must never reach here.
+                        self.ts = None
                 if self.ts is None:
                     team = raw.get("user_team") or raw.get("team")
                     if not team:
@@ -74,18 +92,13 @@ class SlackTaskCards:
                         task_display_mode="plan",
                         chunks=[
                             {"type": "plan_update", "title": "AstrBot 工具进度"},
-                            task,
+                            *(
+                                task if key == task_id else value
+                                for key, value in self.tasks.items()
+                            ),
                         ],
                     )
                     self.ts = response["ts"]
-                else:
-                    await slack_api_request(
-                        client,
-                        "chat_appendStream",
-                        channel=raw["channel"],
-                        ts=self.ts,
-                        chunks=[task],
-                    )
                 self.tasks[task_id] = task
                 return
             except Exception as exc:
