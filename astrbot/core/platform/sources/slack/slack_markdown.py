@@ -68,7 +68,9 @@ def split_slack_markdown(text: str) -> list[str]:
                     end = opening
                 elif closing < end < block_end and closing > start:
                     end = closing
-                if body_start <= end <= closing and opening < end:
+                # Only seal actual message boundaries. The last chunk may still
+                # receive streaming deltas, so its source fence must stay open.
+                if body_start <= end <= closing and opening < end < len(text):
                     # An exceptionally long fence cannot be reopened within the
                     # payload limit; keep its source rather than stall splitting.
                     if len(opener) + len(marker) + 2 < limit // 2:

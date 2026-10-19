@@ -422,7 +422,7 @@ async def test_oversized_stream_preserves_all_characters(stream, content):
     code = "    print('缩进')\n" * 3000
     text = {
         "plain": "a" * 12001 + "b" * 28000,
-        "code": "```python\n" + code + "```",
+        "code": "```python\n" + code + "```\n\nAfter code.",
         "already_visible_list": "a" * 5000 + "\n\n- Parent\n" + "  - Child\n" * 750,
     }[content]
     messages = {}
@@ -444,9 +444,20 @@ async def test_oversized_stream_preserves_all_characters(stream, content):
 
     async def chunks():
         yield MessageChain([Plain(text[:split])])
-        yield MessageChain([Plain(text[split:])])
+        # Continue generating after multiple message-size boundaries.
+        size = 4096 if content == "code" else len(text)
+        for start in range(split, len(text), size):
+            yield MessageChain([Plain(text[start : start + size])])
 
-    await stream.event.send_streaming(chunks())
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {"provider_settings": {}}
+    await stage.process(stream.event)
     calls = stream.api.await_args_list
     assert calls[0].args[0] == (
         "chat.startStream" if stream.native else "chat.postMessage"
@@ -454,6 +465,8 @@ async def test_oversized_stream_preserves_all_characters(stream, content):
     assert len(messages) > 1
     assert all(len(part) <= 12_000 for part in messages.values())
     if content == "code":
+        assert all(part.count("```") == 2 for part in messages.values())
+        assert list(messages.values())[-1].endswith("```\n\nAfter code.")
         assert (
             "".join(
                 block
