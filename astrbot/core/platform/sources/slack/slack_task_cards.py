@@ -1,5 +1,7 @@
 """Optional task progress, independent of Slack answer delivery."""
 
+import time
+from copy import copy
 from typing import TYPE_CHECKING
 
 from slack_sdk.errors import SlackApiError
@@ -7,8 +9,6 @@ from slack_sdk.errors import SlackApiError
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Json
-
-from .slack_stream import slack_api_request
 
 if TYPE_CHECKING:
     from .slack_event import SlackMessageEvent
@@ -25,9 +25,40 @@ class SlackTaskCards:
         self.event = event
         self.ts: str | None = None
         self.tasks: dict[str, dict] = {}
+        self.pending: dict[str, dict] = {}
+        self.retry_at = 0.0
         self.disabled = False
         self.fallback = False
         self.fallback_ts: str | None = None
+
+    async def _request(self, method: str, **kwargs):
+        """Send optional progress without sleeping or retrying SDK writes.
+
+        Args:
+            method: Slack SDK method name.
+            **kwargs: Request payload.
+
+        Returns:
+            Slack's response.
+
+        Raises:
+            SlackApiError: Slack rejected the request; rate limits set a cooldown.
+        """
+        client = copy(self.event.web_client)
+        client.retry_handlers = []
+        try:
+            return await getattr(client, method)(**kwargs)
+        except SlackApiError as exc:
+            if exc.response.get("error") in {"ratelimited", "rate_limited"}:
+                headers = getattr(exc.response, "headers", {}) or {}
+                try:
+                    delay = float(
+                        headers.get("Retry-After", headers.get("retry-after", "1"))
+                    )
+                except (TypeError, ValueError):
+                    delay = 1.0
+                self.retry_at = time.monotonic() + max(1.0, delay)
+            raise
 
     async def update(self, chain: MessageChain) -> None:
         """Apply a structured tool start or result without exposing tool arguments.
@@ -57,18 +88,19 @@ class SlackTaskCards:
             return
         # Keep an unconfirmed result pending until Slack acknowledges the update.
         self.tasks[task_id] = {**task, "status": "in_progress"}
+        self.pending[task_id] = task
+        if time.monotonic() < self.retry_at:
+            return
         raw = self.event.message_obj.raw_message
-        client = self.event.web_client
         if not self.fallback:
             try:
                 if self.ts is not None:
                     try:
-                        await slack_api_request(
-                            client,
+                        await self._request(
                             "chat_appendStream",
                             channel=raw["channel"],
                             ts=self.ts,
-                            chunks=[task],
+                            chunks=list(self.pending.values()),
                         )
                     except SlackApiError as exc:
                         if (
@@ -82,9 +114,8 @@ class SlackTaskCards:
                 if self.ts is None:
                     team = raw.get("user_team") or raw.get("team")
                     if not team:
-                        team = (await slack_api_request(client, "auth_test"))["team_id"]
-                    response = await slack_api_request(
-                        client,
+                        team = (await self._request("auth_test"))["team_id"]
+                    response = await self._request(
                         "chat_startStream",
                         channel=raw["channel"],
                         thread_ts=raw["thread_ts"],
@@ -93,16 +124,19 @@ class SlackTaskCards:
                         task_display_mode="plan",
                         chunks=[
                             {"type": "plan_update", "title": "AstrBot 工具进度"},
-                            *(
-                                task if key == task_id else value
-                                for key, value in self.tasks.items()
-                            ),
+                            *{**self.tasks, **self.pending}.values(),
                         ],
                     )
                     self.ts = response["ts"]
-                self.tasks[task_id] = task
+                self.tasks.update(self.pending)
+                self.pending.clear()
                 return
             except Exception as exc:
+                if isinstance(exc, SlackApiError) and exc.response.get("error") in {
+                    "ratelimited",
+                    "rate_limited",
+                }:
+                    return
                 # Only explicit capability/format rejections allow a text fallback.
                 # Unknown write outcomes must never create another progress stream.
                 self.fallback = isinstance(exc, SlackApiError) and exc.response.get(
@@ -129,14 +163,13 @@ class SlackTaskCards:
                 "complete": "已完成",
                 "error": "失败",
             }
-            tasks = {**self.tasks, task_id: task}
+            tasks = {**self.tasks, **self.pending}
             text = "AstrBot 工具进度\n" + "\n".join(
                 f"• {item['title']}：{statuses[item['status']]}"
                 for item in tasks.values()
             )
             try:
-                response = await slack_api_request(
-                    client,
+                response = await self._request(
                     "chat_update" if self.fallback_ts else "chat_postMessage",
                     channel=raw["channel"],
                     **(
@@ -148,8 +181,14 @@ class SlackTaskCards:
                     parse="full",
                 )
                 self.fallback_ts = response["ts"]
-                self.tasks[task_id] = task
-            except Exception:
+                self.tasks.update(self.pending)
+                self.pending.clear()
+            except Exception as exc:
+                if isinstance(exc, SlackApiError) and exc.response.get("error") in {
+                    "ratelimited",
+                    "rate_limited",
+                }:
+                    return
                 self.disabled = True
                 logger.warning("Slack task progress fallback failed.", exc_info=True)
 
@@ -158,7 +197,11 @@ class SlackTaskCards:
         if (
             self.fallback_ts
             and not self.disabled
-            and any(task["status"] == "in_progress" for task in self.tasks.values())
+            and time.monotonic() >= self.retry_at
+            and (
+                self.pending
+                or any(task["status"] == "in_progress" for task in self.tasks.values())
+            )
         ):
             # Attempt cleanup once; never resume progress after an uncertain write.
             self.disabled = True
@@ -168,15 +211,14 @@ class SlackTaskCards:
                 "error": "失败",
             }
             try:
-                await slack_api_request(
-                    self.event.web_client,
+                await self._request(
                     "chat_update",
                     channel=self.event.message_obj.raw_message["channel"],
                     ts=self.fallback_ts,
                     text="AstrBot 工具进度\n"
                     + "\n".join(
                         f"• {task['title']}：{statuses[task['status']]}"
-                        for task in self.tasks.values()
+                        for task in {**self.tasks, **self.pending}.values()
                     ),
                     parse="full",
                 )
@@ -184,33 +226,32 @@ class SlackTaskCards:
                 logger.warning("Slack text progress cleanup failed.", exc_info=True)
         if not self.ts:
             return
-        client = self.event.web_client
         channel = self.event.message_obj.raw_message["channel"]
         try:
+            tasks = dict(self.tasks)
+            if not self.disabled and not self.fallback:
+                tasks.update(self.pending)
             pending = [
                 {
                     **task,
                     "status": "error",
                     "title": task["title"][:240] + "（状态未确认）",
                 }
-                for task in self.tasks.values()
                 if task["status"] == "in_progress"
+                else task
+                for key, task in tasks.items()
+                if task["status"] == "in_progress"
+                or (key in self.pending and not self.disabled and not self.fallback)
             ]
-            if pending:
-                await slack_api_request(
-                    client,
-                    "chat_appendStream",
-                    channel=channel,
-                    ts=self.ts,
-                    chunks=pending,
-                )
+            # stopStream has its own rate limit and can seal the final snapshot
+            # even while appendStream is cooling down. Never replay these chunks.
+            await self._request(
+                "chat_stopStream",
+                channel=channel,
+                ts=self.ts,
+                **({"chunks": pending} if pending else {}),
+            )
         except Exception:
-            logger.warning("Slack task-card final status update failed.", exc_info=True)
+            logger.warning("Slack task-card cleanup failed.", exc_info=True)
         finally:
-            try:
-                await slack_api_request(
-                    client, "chat_stopStream", channel=channel, ts=self.ts
-                )
-            except Exception:
-                logger.warning("Slack task-card cleanup failed.", exc_info=True)
             self.ts = None

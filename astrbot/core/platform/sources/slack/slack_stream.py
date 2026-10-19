@@ -77,7 +77,7 @@ class SlackMessageStream:
     """
 
     def __init__(self, event: "SlackMessageEvent") -> None:
-        # Task cards share this module's delivery policy; import after initialization.
+        # Load the optional task-card implementation only when creating a stream.
         from .slack_task_cards import SlackTaskCards
 
         self.event = event

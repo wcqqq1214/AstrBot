@@ -111,6 +111,12 @@ is closed, AstrBot attempts to open a new card in the same thread with the curre
 task states, once per update. The old card remains visible. If reopening fails,
 the same fallback rules apply.
 
+Progress rate limits do not pause tool execution. AstrBot retains the latest task
+states during `Retry-After` and sends them on the next progress event after the
+cooldown. On completion, native cards attempt to seal with the final states. Text
+progress still in cooldown is left unchanged; no background retry is scheduled.
+Answer delivery keeps its existing rate-limit handling.
+
 ## Test the Connection
 
 Enter the Slack workspace you just added, navigate to the channel where you want to use the bot, then @ mention the app you just created. Click the Add button in the message subsequently sent by Slackbot to add it to the workspace. Then, @ mention the app and type `/help`. If it responds successfully, the test is successful.

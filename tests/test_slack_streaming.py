@@ -1125,14 +1125,23 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True], indirect=True)
 @pytest.mark.parametrize(
-    "failure", ["rejected", "start_lost", "append_lost", "stop_lost", "rate_limit"]
+    "failure",
+    [
+        "rejected",
+        "start_lost",
+        "append_lost",
+        "stop_lost",
+        "rate_limit",
+        "stop_rate_limit",
+    ],
 )
 async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, failure):
     stream.event.native_task_cards = True
     requests = []
     failed = False
+    sleep = AsyncMock()
     monkeypatch.setattr(
-        "astrbot.core.platform.sources.slack.slack_stream.asyncio.sleep", AsyncMock()
+        "astrbot.core.platform.sources.slack.slack_stream.asyncio.sleep", sleep
     )
 
     async def api(method, **kwargs):
@@ -1152,12 +1161,12 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
             or (
                 method == "chat.stopStream"
                 and body["ts"] == "1"
-                and failure == "stop_lost"
+                and failure in {"stop_lost", "stop_rate_limit"}
             )
         )
         if targeted and not failed:
             failed = True
-            if failure in {"rejected", "rate_limit"}:
+            if failure in {"rejected", "rate_limit", "stop_rate_limit"}:
                 raise SlackApiError(
                     "controlled failure",
                     {
@@ -1182,7 +1191,8 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
 
     await stream.event.send_streaming(chunks())
     starts = [body for _, body in requests if body.get("task_display_mode")]
-    assert len(starts) == (2 if failure == "rate_limit" else 1)
+    assert len(starts) == 1
+    sleep.assert_not_awaited()
     assert any(body.get("markdown_text") == "Final" for _, body in requests)
     if failure == "start_lost":
         assert not any(
@@ -1206,6 +1216,131 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
             "error",
         ]
         assert updates[-1]["title"].endswith("（状态未确认）")
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize("limited", ["start", "append", "text_post", "text_update"])
+@pytest.mark.parametrize("recover", [False, True])
+async def test_progress_rate_limit_coalesces_without_waiting_through_respond(
+    stream, monkeypatch, limited, recover
+):
+    from slack_sdk.http_retry.builtin_async_handlers import (
+        AsyncRateLimitErrorRetryHandler,
+    )
+
+    stream.event.native_task_cards = True
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_task_cards.time",
+        SimpleNamespace(monotonic=lambda: stream.clock.now),
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_stream.asyncio.sleep", sleep
+    )
+    requests = []
+    answers = []
+    rejected = False
+    text_mode = limited.startswith("text_")
+    target = {
+        "start": "chat.startStream",
+        "append": "chat.appendStream",
+        "text_post": "chat.postMessage",
+        "text_update": "chat.update",
+    }[limited]
+
+    async def handle(request):
+        nonlocal rejected
+        method = request.match_info["method"]
+        body = await request.json()
+        if "markdown_text" in body or body.get("ts") == "answer":
+            answers.append(body.get("markdown_text"))
+            return web.json_response({"ok": True, "ts": "answer"})
+        if text_mode and body.get("task_display_mode"):
+            return web.json_response({"ok": False, "error": "invalid_arguments"})
+        requests.append((method, body, stream.clock.now))
+        if method == target and not rejected:
+            rejected = True
+            return web.json_response(
+                {"ok": False, "error": "rate_limited"},
+                headers={"Retry-After": "10"},
+                status=429,
+            )
+        return web.json_response({"ok": True, "ts": "progress"})
+
+    async def chunks():
+        for task_id in ("first", "second", "third"):
+            if task_id == "second":
+                stream.clock.now = 1
+            elif task_id == "third":
+                # Tool execution can reach this point without waiting for Slack.
+                assert len(requests) == (
+                    2 if limited in {"append", "text_update"} else 1
+                )
+                assert all(call.args[0] == 0 for call in sleep.await_args_list)
+                stream.clock.now = 11 if recover else 2
+            yield MessageChain(
+                [Json(data={"id": task_id, "name": task_id})], type="tool_call"
+            )
+            yield MessageChain(
+                [Json(data={"id": task_id, "is_error": task_id == "third"})],
+                type="tool_call_result",
+            )
+        yield MessageChain([Plain("Final")])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    app = web.Application()
+    app.router.add_post("/{method}", handle)
+    async with TestServer(app) as server:
+        client = AsyncWebClient(
+            token="test",
+            base_url=str(server.make_url("/")),
+            retry_handlers=[AsyncRateLimitErrorRetryHandler(max_retry_count=1)],
+        )
+        client.proxy = None
+        stream.event.web_client = client
+        original_retries = list(client.retry_handlers)
+        await stage.process(stream.event)
+    assert all(call.args[0] == 0 for call in sleep.await_args_list)
+    assert stream.event.web_client.retry_handlers == original_retries
+    assert "Final" in answers
+    if recover:
+        resumed = next(body for _, body, now in requests if now == 11)
+        if text_mode:
+            assert (
+                resumed["text"]
+                == "AstrBot 工具进度\n• first：已完成\n• second：已完成\n• third：进行中"
+            )
+            assert requests[-1][1]["text"].endswith("third：失败")
+        else:
+            assert [
+                (c["id"], c["status"])
+                for c in resumed["chunks"]
+                if c["type"] == "task_update"
+            ] == [
+                ("first", "complete"),
+                ("second", "complete"),
+                ("third", "in_progress"),
+            ]
+    else:
+        late = [(method, body) for method, body, now in requests if now > 0]
+        if limited == "append":
+            assert len(late) == 1 and late[0][0] == "chat.stopStream"
+            assert [(c["id"], c["status"]) for c in late[0][1]["chunks"]] == [
+                ("first", "complete"),
+                ("second", "complete"),
+                ("third", "error"),
+            ]
+        else:
+            assert late == []
     assert stream.event._stream is None
 
 
