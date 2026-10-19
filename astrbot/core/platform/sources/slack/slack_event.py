@@ -18,6 +18,7 @@ from astrbot.api.message_components import (
     Image,
     Plain,
     Record,
+    Reply,
 )
 from astrbot.api.platform import Group, MessageMember
 from astrbot.core.platform.button_interaction import encode_button_callback
@@ -248,7 +249,7 @@ class SlackMessageEvent(AstrMessageEvent):
         channel_id: str,
         plain_texts: set[str] | None = None,
     ) -> None:
-        """Send ordered Slack message parts with a plain-text retry.
+        """Send plain Markdown or mixed blocks with the existing text retry.
 
         Args:
             message: Message components in delivery order.
@@ -256,6 +257,22 @@ class SlackMessageEvent(AstrMessageEvent):
             channel_id: Destination channel or user ID.
             plain_texts: Text also delivered separately by the response pipeline.
         """
+        # Reply metadata does not change the content type of a text-only message.
+        if all(isinstance(segment, (Plain, Reply)) for segment in message.chain):
+            content = "".join(
+                segment.text for segment in message.chain if isinstance(segment, Plain)
+            )
+            if not content.strip():
+                return
+            # Slack forbids text/blocks alongside markdown_text and caps it at 12k.
+            # Keep oversized messages on the existing delivery path.
+            if len(content) <= 12_000:
+                await web_client.chat_postMessage(
+                    channel=channel_id,
+                    markdown_text=content,
+                )
+                return
+
         plain_texts = (plain_texts or set()) | {
             segment.text for segment in message.chain if isinstance(segment, Plain)
         }

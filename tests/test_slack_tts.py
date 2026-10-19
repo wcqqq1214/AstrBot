@@ -106,7 +106,10 @@ async def test_slack_tts_upload_failure_preserves_source_text(
     client.chat_postMessage.assert_awaited_once()
     payload = client.chat_postMessage.await_args.kwargs
     assert payload["channel"] == "C123"
-    assert payload["blocks"][0]["text"]["text"] == "Speech test."
+    if dual_output:
+        assert payload == {"channel": "C123", "markdown_text": "Speech test."}
+    else:
+        assert payload["blocks"][0]["text"]["text"] == "Speech test."
 
 
 @pytest.mark.asyncio
