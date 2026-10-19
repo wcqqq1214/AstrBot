@@ -94,6 +94,7 @@ class SlackMessageStream:
         self.ts: str | None = None
         self.text = ""
         self.sent = ""
+        self.empty_text: str | None = None
         self.open = False
         self.last_update = 0.0
         self.lock = asyncio.Lock()
@@ -114,11 +115,18 @@ class SlackMessageStream:
             return
         if not final and (
             self.text == self.sent
+            or self.text == self.empty_text
             or (self.ts is not None and time.monotonic() - self.last_update < 1.5)
         ):
             return
 
-        body = {"markdown_text": self.text}
+        # Preserve a completed literal marker without retrying empty Markdown.
+        literal = final and self.text == self.empty_text
+        body = (
+            {"text": self.text, "mrkdwn": False}
+            if literal
+            else {"markdown_text": self.text}
+        )
         # A safe split may move already-visible text to the next message. Replace
         # the existing head in place instead of appending overlapping characters.
         if self.native and self.sent and not self.text.startswith(self.sent):
@@ -129,7 +137,7 @@ class SlackMessageStream:
                 self.open = False
             self.native = False
 
-        if self.native:
+        if self.native and not literal:
             start_attempted = False
             try:
                 if self.ts is None:
@@ -172,6 +180,9 @@ class SlackMessageStream:
                         if isinstance(exc, SlackApiError)
                         else None
                     )
+                    if error == "no_text" and not final:
+                        self.empty_text = self.text
+                        return
                     if error not in _STREAM_CAPABILITY_ERRORS and error not in {
                         "not_allowed",
                         "streaming_not_allowed",
@@ -203,14 +214,21 @@ class SlackMessageStream:
                 self.native = False
                 logger.info("Slack native streaming unavailable; using message edits.")
 
-        if not self.native:
+        if not self.native or literal:
             if self.ts is None:
                 destination = {"channel": self.channel}
                 if self.thread:
                     destination["thread_ts"] = self.thread
-                response = await slack_api_request(
-                    self.client, "chat_postMessage", **destination, **body
-                )
+                try:
+                    response = await slack_api_request(
+                        self.client, "chat_postMessage", **destination, **body
+                    )
+                except SlackApiError as exc:
+                    if exc.response.get("error") != "no_text" or final:
+                        raise
+                    # Slack can reject an unfinished heading before content arrives.
+                    self.empty_text = self.text
+                    return
                 self.ts = response["ts"]
             elif self.sent != self.text or self.open:
                 await slack_api_request(
@@ -226,6 +244,7 @@ class SlackMessageStream:
         if final:
             self.ts = None
             self.text = self.sent = ""
+            self.empty_text = None
             self.last_update = 0.0
 
     async def run(self, generator: AsyncGenerator[MessageChain, None]) -> None:
@@ -255,7 +274,11 @@ class SlackMessageStream:
                 if pending is None:
                     pending = asyncio.create_task(queue.get())
                 timeout = None
-                if self.text.strip() and self.text != self.sent:
+                if (
+                    self.text.strip()
+                    and self.text != self.sent
+                    and self.text != self.empty_text
+                ):
                     timeout = max(0.0, self.last_update + 1.5 - time.monotonic())
                 done, _ = await asyncio.wait(
                     {pending, producer},

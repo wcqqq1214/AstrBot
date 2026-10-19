@@ -71,6 +71,8 @@ class InternalAgentSubStage(Stage):
         capture = None
         consumed = activated = typing = False
         turn = None
+        bind_turn = None
+        chains = None
         is_wakeup = isinstance(event, AgentWakeupEvent)
         target = event.agent_session if isinstance(event, AgentWakeupEvent) else None
         try:
@@ -161,6 +163,10 @@ class InternalAgentSubStage(Stage):
                 self.unsupported_streaming_strategy == "turn_off"
                 and not event.platform_meta.support_streaming_message
             )
+            if streaming and not stream_to_general:
+                bind_turn = getattr(type(event), "bind_agent_turn", None)
+                if bind_turn is not None:
+                    bind_turn(event, turn)
             chains = present_turn(
                 turn,
                 streaming=streaming,
@@ -240,12 +246,20 @@ class InternalAgentSubStage(Stage):
             )
             await event.send(MessageChain().message(str(error)))
         finally:
-            if turn is not None:
-                active_event_registry.unregister_agent_stop_callback(
-                    event, turn.request_stop
-                )
-                if not turn.done:
-                    await turn.cancel()
+            try:
+                if chains is not None:
+                    await chains.aclose()
+            finally:
+                try:
+                    if turn is not None:
+                        active_event_registry.unregister_agent_stop_callback(
+                            event, turn.request_stop
+                        )
+                        if not turn.done:
+                            await turn.cancel()
+                finally:
+                    if bind_turn is not None:
+                        bind_turn(event, None)
             if typing:
                 try:
                     await event.stop_typing()

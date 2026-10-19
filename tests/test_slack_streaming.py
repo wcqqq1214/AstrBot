@@ -123,6 +123,52 @@ async def test_progressive_lists_through_respond_stage(stream, strategy):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("complete_heading", [True, False])
+async def test_empty_markdown_prefix_is_buffered_through_respond_stage(
+    stream, complete_heading
+):
+    accepted = []
+
+    async def api(method, **kwargs):
+        body = kwargs["json"]
+        if body.get("markdown_text") == "#":
+            raise SlackApiError("Empty rendered Markdown", {"error": "no_text"})
+        if "markdown_text" in body or "text" in body:
+            accepted.append(body)
+        return {"ok": True, "ts": "1.0"}
+
+    stream.api.side_effect = api
+    content = "# Heading\n\n- Parent\n  - Child\n\nFollowing paragraph."
+
+    async def chunks():
+        yield MessageChain([Plain("#")])
+        assert stream.api.await_count == 1
+        if complete_heading:
+            yield MessageChain([Plain(content[1:])])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    await stage.process(stream.event)
+    destination = {"channel": "C123"}
+    if stream.native:
+        destination["thread_ts"] = "0.1"
+    assert len(accepted) == 1
+    assert accepted[0]["channel"] == "C123"
+    assert accepted[0].get("thread_ts") == destination.get("thread_ts")
+    if complete_heading:
+        assert accepted[0]["markdown_text"] == content
+    else:
+        assert accepted[0] == {**destination, "text": "#", "mrkdwn": False}
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
 async def test_media_and_tool_boundaries_close_before_next_send(stream):
     async def chunks():
         yield MessageChain([Plain("图片前。\n  - 子项")])

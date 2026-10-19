@@ -2,6 +2,7 @@ import asyncio
 import math
 import random
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 
 import astrbot.core.message.components as Comp
 from astrbot.core import logger
@@ -264,37 +265,43 @@ class RespondStage(Stage):
                 """
                 nonlocal outline_bytes, outline_truncated
                 iterator = stream.__aiter__()
-                while True:
-                    # Tool/plugin sends during generation are independent responses.
-                    generation_token = streaming_response_event.set(None)
-                    try:
-                        chain = await iterator.__anext__()
-                    except StopAsyncIteration:
-                        break
-                    finally:
-                        streaming_response_event.reset(generation_token)
-                    if chain.type not in {
-                        "break",
-                        "reasoning",
-                        "audio_chunk",
-                        "tool_call",
-                        "agent_stats",
-                    }:
-                        fragment = event._outline_chain(chain.chain)
-                        remaining = 4096 - outline_bytes
-                        if remaining >= 16:
-                            preview = bounded_text(fragment, remaining)
-                            stream_outline.append(preview)
-                            outline_bytes += len(preview.encode())
-                            outline_truncated |= preview != fragment
-                        elif fragment:
-                            outline_truncated = True
-                    yield chain
+                try:
+                    while True:
+                        # Tool/plugin sends during generation are independent responses.
+                        generation_token = streaming_response_event.set(None)
+                        try:
+                            chain = await iterator.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        finally:
+                            streaming_response_event.reset(generation_token)
+                        if chain.type not in {
+                            "break",
+                            "reasoning",
+                            "audio_chunk",
+                            "tool_call",
+                            "agent_stats",
+                        }:
+                            fragment = event._outline_chain(chain.chain)
+                            remaining = 4096 - outline_bytes
+                            if remaining >= 16:
+                                preview = bounded_text(fragment, remaining)
+                                stream_outline.append(preview)
+                                outline_bytes += len(preview.encode())
+                                outline_truncated |= preview != fragment
+                            elif fragment:
+                                outline_truncated = True
+                        yield chain
+
+                finally:
+                    if close := getattr(iterator, "aclose", None):
+                        await close()
 
             # Adapter chunks and protocol closing frames share one final trace.
             stream_token = streaming_response_event.set(event)
             try:
-                await event.send_streaming(traced_stream(), realtime_segmenting)
+                async with aclosing(traced_stream()) as response_stream:
+                    await event.send_streaming(response_stream, realtime_segmenting)
             finally:
                 streaming_response_event.reset(stream_token)
             outline = "".join(stream_outline)
