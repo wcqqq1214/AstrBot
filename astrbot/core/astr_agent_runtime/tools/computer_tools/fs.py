@@ -66,6 +66,7 @@ from . import util as computer_util
 from .util import (
     check_admin_permission,
     check_local_file_permission,
+    execution_error_result,
     get_local_permission_policy,
     is_local_runtime,
     normalize_umo_for_workspace,
@@ -376,7 +377,7 @@ class FileReadTool(FunctionTool):
     ) -> ToolExecResult:
         permission_error = check_local_file_permission(context)
         if permission_error:
-            return permission_error
+            return execution_error_result(permission_error)
         local_env = is_local_runtime(context)
         restricted = _is_restricted_env(context)
         current_workspace_root = (
@@ -397,7 +398,7 @@ class FileReadTool(FunctionTool):
             if not normalized_path:
                 raise ValueError("`path` must be a non-empty string.")
             if local_env and os.path.isdir(normalized_path):
-                return (
+                return execution_error_result(
                     f"Error: '{normalized_path}' is a directory, not a file. "
                     "Use a file path instead, or use 'astrbot_execute_shell' to list directory contents."
                 )
@@ -437,16 +438,16 @@ class FileReadTool(FunctionTool):
                 if file_descriptor is not None:
                     os.close(file_descriptor)
         except IsADirectoryError:
-            return (
+            return execution_error_result(
                 f"Error: '{normalized_path}' is a directory, not a file. "
                 "Use a file path instead, or use 'astrbot_execute_shell' to list "
                 "directory contents."
             )
         except PermissionError as exc:
-            return f"Error: {exc}"
+            return execution_error_result(f"Error: {exc}")
         except Exception as exc:
             logger.error(f"Error reading file: {exc}")
-            return f"Error reading file: {exc}"
+            return execution_error_result(f"Error reading file: {exc}")
 
 
 @builtin_tool(config=_COMPUTER_RUNTIME_TOOL_CONFIG)
@@ -479,7 +480,7 @@ class FileWriteTool(FunctionTool):
     ) -> ToolExecResult:
         permission_error = check_local_file_permission(context)
         if permission_error:
-            return permission_error
+            return execution_error_result(permission_error)
         local_env = is_local_runtime(context)
         restricted = _is_restricted_env(context)
         current_workspace_root = (
@@ -544,16 +545,16 @@ class FileWriteTool(FunctionTool):
                     os.close(file_descriptor)
             if not result.get("success", False):
                 error_detail = str(result.get("error", "") or "").strip()
-                return (
+                return execution_error_result(
                     "Error writing file: "
                     f"{error_detail or 'unknown filesystem write error'}"
                 )
             return f"File written successfully: {normalized_path}"
         except PermissionError as exc:
-            return f"Error: {exc}"
+            return execution_error_result(f"Error: {exc}")
         except Exception as exc:
             logger.error(f"Error writing file: {exc}")
-            return f"Error writing file: {exc}"
+            return execution_error_result(f"Error writing file: {exc}")
 
 
 @builtin_tool(config=_COMPUTER_RUNTIME_TOOL_CONFIG)
@@ -597,7 +598,7 @@ class FileEditTool(FunctionTool):
         umo = str(context.context.event.unified_msg_origin)
         permission_error = check_local_file_permission(context)
         if permission_error:
-            return permission_error
+            return execution_error_result(permission_error)
         local_env = is_local_runtime(context)
         restricted = _is_restricted_env(context)
         current_workspace_root = (
@@ -672,7 +673,7 @@ class FileEditTool(FunctionTool):
                     os.close(file_descriptor)
             if not result.get("success", False):
                 error_detail = str(result.get("error", "") or "").strip()
-                return (
+                return execution_error_result(
                     "Error editing file: "
                     f"{error_detail or 'unknown filesystem edit error'}"
                 )
@@ -683,10 +684,10 @@ class FileEditTool(FunctionTool):
                 f"Replaced {replacements} occurrence(s) using {mode_text} mode."
             )
         except PermissionError as exc:
-            return f"Error: {exc}"
+            return execution_error_result(f"Error: {exc}")
         except Exception as exc:
             logger.error(f"Error editing file: {exc}")
-            return f"Error editing file: {exc}"
+            return execution_error_result(f"Error editing file: {exc}")
 
 
 @builtin_tool(config=_COMPUTER_RUNTIME_TOOL_CONFIG)
@@ -866,11 +867,13 @@ class GrepTool(FunctionTool):
     ) -> ToolExecResult:
         normalized_pattern = pattern.strip()
         if not normalized_pattern:
-            return "Error: `pattern` must be a non-empty string."
+            return execution_error_result(
+                "Error: `pattern` must be a non-empty string."
+            )
 
         permission_error = check_local_file_permission(context)
         if permission_error:
-            return permission_error
+            return execution_error_result(permission_error)
         local_env = is_local_runtime(context)
         restricted = _is_restricted_env(context)
         current_workspace_root = (
@@ -943,7 +946,7 @@ class GrepTool(FunctionTool):
                 if not result.get("success", False):
                     error_detail = str(result.get("error", "") or "").strip()
                     logger.error("GrepTool search failed: %s", error_detail)
-                    return (
+                    return execution_error_result(
                         "Error searching files: "
                         f"{error_detail or 'unknown filesystem search error'}"
                     )
@@ -957,10 +960,10 @@ class GrepTool(FunctionTool):
                 has_context=has_context,
             )
         except PermissionError as exc:
-            return f"Error: {exc}"
+            return execution_error_result(f"Error: {exc}")
         except Exception as exc:
             logger.error(f"Error searching files: {exc}")
-            return f"Error searching files: {exc}"
+            return execution_error_result(f"Error searching files: {exc}")
 
 
 @builtin_tool(config=_SANDBOX_RUNTIME_TOOL_CONFIG)
@@ -994,9 +997,9 @@ class FileUploadTool(FunctionTool):
         self,
         context: ContextWrapper[AstrAgentContext],
         local_path: str,
-    ) -> str | None:
+    ) -> ToolExecResult:
         if permission_error := check_admin_permission(context, "File upload/download"):
-            return permission_error
+            return execution_error_result(permission_error)
         sb = await get_booter(
             context.context.context,
             context.context.event.unified_msg_origin,
@@ -1004,10 +1007,14 @@ class FileUploadTool(FunctionTool):
         try:
             # Check if file exists
             if not os.path.exists(local_path):
-                return f"Error: File does not exist: {local_path}"
+                return execution_error_result(
+                    f"Error: File does not exist: {local_path}"
+                )
 
             if not os.path.isfile(local_path):
-                return f"Error: Path is not a file: {local_path}"
+                return execution_error_result(
+                    f"Error: Path is not a file: {local_path}"
+                )
 
             # Use basename if sandbox_filename is not provided
             remote_path = os.path.basename(local_path)
@@ -1018,7 +1025,9 @@ class FileUploadTool(FunctionTool):
             success = result.get("success", False)
 
             if not success:
-                return f"Error uploading file: {result.get('message', 'Unknown error')}"
+                return execution_error_result(
+                    f"Error uploading file: {result.get('message', 'Unknown error')}"
+                )
 
             file_path = result.get("file_path", "")
             logger.info(f"File {local_path} uploaded to sandbox at {file_path}")
@@ -1026,7 +1035,7 @@ class FileUploadTool(FunctionTool):
             return f"File uploaded successfully to {file_path}"
         except Exception as e:
             logger.error(f"Error uploading file {local_path}: {e}")
-            return f"Error uploading file: {str(e)}"
+            return execution_error_result(f"Error uploading file: {str(e)}")
 
 
 @builtin_tool(config=_SANDBOX_RUNTIME_TOOL_CONFIG)
@@ -1062,7 +1071,7 @@ class FileDownloadTool(FunctionTool):
         also_send_to_user: bool = True,
     ) -> ToolExecResult:
         if permission_error := check_admin_permission(context, "File upload/download"):
-            return permission_error
+            return execution_error_result(permission_error)
         sb = await get_booter(
             context.context.context,
             context.context.event.unified_msg_origin,
@@ -1096,7 +1105,7 @@ class FileDownloadTool(FunctionTool):
                     await context.context.event.send(message)
                 except Exception as e:
                     logger.error(f"Error sending file message: {e}")
-                    return (
+                    return execution_error_result(
                         f"File downloaded successfully to {local_path} "
                         f"but sending to user failed: {e}"
                     )
@@ -1115,4 +1124,4 @@ class FileDownloadTool(FunctionTool):
             return f"File downloaded successfully to {local_path}"
         except Exception as e:
             logger.error(f"Error downloading file {remote_path}: {e}")
-            return f"Error downloading file: {str(e)}"
+            return execution_error_result(f"Error downloading file: {str(e)}")

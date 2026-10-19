@@ -114,7 +114,7 @@ async def test_concurrent_and_completed_retries_send_only_one_reply(ingress):
         await asyncio.wait_for(entered.wait(), timeout=2)
         # Pending work must not expire while message conversion is still running.
         ingress.clock.now = 601
-        assert await ingress.deliver() == 200
+        assert await ingress.deliver() == (503 if ingress.mode == "webhook" else 200)
     finally:
         release.set()
         await first
@@ -180,3 +180,46 @@ async def test_distinct_missing_and_expired_ids_are_not_dropped(ingress):
         ingress.adapter._seen_event_ids[f"cached-{number}"] = 600
     assert await ingress.deliver("latest") == 200
     assert len(ingress.adapter._seen_event_ids) == 10_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ingress", ["webhook"], indirect=True)
+@pytest.mark.parametrize("failure", ["conversion", "cancel"])
+async def test_pending_retry_then_original_failure_still_sends_once(ingress, failure):
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = ingress.adapter.convert_message
+
+    async def convert(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        raise RuntimeError("conversion failed")
+
+    ingress.adapter.convert_message = convert
+    first = asyncio.create_task(ingress.deliver())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert await ingress.deliver() == 503
+        assert ingress.queue.empty()
+    finally:
+        if failure == "cancel":
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        else:
+            release.set()
+            assert await first == 500
+        ingress.adapter.convert_message = original
+
+    assert await ingress.deliver() == 200
+    assert await ingress.deliver() == 200
+    assert ingress.queue.qsize() == 1
+    event = ingress.queue.get_nowait()
+    event.set_result(MessageEventResult(chain=[Plain("Recovered reply")]))
+    stage = RespondStage()
+    stage.platform_settings, stage.enable_seg = {}, False
+    await stage.process(event)
+    ingress.adapter.web_client.api_call.assert_awaited_once()
+    assert (
+        ingress.adapter.web_client.api_call.call_args.kwargs["json"]["markdown_text"]
+        == "Recovered reply"
+    )

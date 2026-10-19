@@ -219,9 +219,8 @@ async def test_none_scope_denies_all_local_tools_before_accessing_resources(
 
     result = await tool().call(context, **kwargs)
 
-    if tool in {shell.LocalExecuteShellTool, shell.ShellSessionTool, python.LocalPythonTool}:
-        assert result.isError is True
-        result = result.content[0].text
+    assert result.isError is True
+    result = result.content[0].text
     assert "Permission denied" in result
     assert "Local Permission Policies" in result
     booter.assert_not_called()

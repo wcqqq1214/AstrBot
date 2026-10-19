@@ -117,7 +117,9 @@ class SlackWebhookClient:
                 return Response("", status_code=200)
             # 处理事件
             if self.event_handler and event_data.get("type") == "event_callback":
-                await self.event_handler(event_data)
+                if await self.event_handler(event_data) is False:
+                    # Preserve retries until the original delivery has been enqueued.
+                    return Response("Event is still being processed", status_code=503)
 
             return Response("", status_code=200)
 

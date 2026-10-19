@@ -660,12 +660,12 @@ async def _read_local_supported_document_result(
         if not selected_content:
             return "No content found at the requested line offset."
         if validation_error := _validate_text_output(selected_content):
-            return validation_error
+            raise ValueError(validation_error.removeprefix("Error reading file: "))
         return selected_content
 
     if not workspace_dir:
-        return (
-            "Error reading file: parsed document exceeds the read output limit and "
+        raise ValueError(
+            "parsed document exceeds the read output limit and "
             "no workspace is available for storing converted text."
         )
 
@@ -720,6 +720,24 @@ async def read_file_tool_result(
     workspace_dir: str | None = None,
     local_file_descriptor: int | None = None,
 ) -> ToolExecResult:
+    """Read supported content, raising errors for the calling tool to report.
+
+    Args:
+        booter: Computer runtime used for remote file access.
+        local_mode: Whether the file is on the local host.
+        path: File path in the selected runtime.
+        offset: Optional starting line offset.
+        limit: Optional maximum number of lines.
+        workspace_dir: Directory for storing large converted documents.
+        local_file_descriptor: Validated descriptor for restricted local access.
+
+    Returns:
+        Text content or an image tool result.
+
+    Raises:
+        ValueError: Content is unsupported, invalid, or exceeds the read limit.
+        OSError: The file cannot be accessed.
+    """
     if local_mode:
         probe_payload = await _probe_local_file(path, local_file_descriptor)
     else:
@@ -741,7 +759,7 @@ async def read_file_tool_result(
                 local_file_descriptor,
             )
         except Exception as exc:
-            return f"Error reading file: failed to parse document: {exc}"
+            raise ValueError(f"failed to parse document: {exc}") from exc
 
         if parsed_document is not None:
             return await _read_local_supported_document_result(
@@ -754,7 +772,7 @@ async def read_file_tool_result(
             )
 
     if probe.kind == "binary":
-        return "Error reading file: binary files are not supported by this tool."
+        raise ValueError("binary files are not supported by this tool.")
 
     if probe.kind == "image":
         if local_mode:
@@ -770,12 +788,12 @@ async def read_file_tool_result(
             )
         raw_base64_data = str(image_payload.get("base64", "") or "")
         if not raw_base64_data:
-            return "Error reading file: image payload is empty."
+            raise ValueError("image payload is empty.")
         raw_bytes = base64.b64decode(raw_base64_data)
         compressed_payload = await _compress_image_bytes_to_base64(raw_bytes)
         compressed_base64_data = str(compressed_payload.get("base64", "") or "")
         if not compressed_base64_data:
-            return "Error reading file: compressed image payload is empty."
+            raise ValueError("compressed image payload is empty.")
         return mcp.types.CallToolResult(
             content=[
                 mcp.types.ImageContent(
@@ -790,7 +808,7 @@ async def read_file_tool_result(
 
     if offset is None and limit is None:
         if validation_error := _validate_full_text_read_request(probe):
-            return validation_error
+            raise ValueError(validation_error.removeprefix("Error reading file: "))
 
     if local_mode:
         content = await read_local_text_range(
@@ -817,6 +835,6 @@ async def read_file_tool_result(
         return "No content found at the requested line offset."
 
     if validation_error := _validate_text_output(content):
-        return validation_error
+        raise ValueError(validation_error.removeprefix("Error reading file: "))
 
     return content

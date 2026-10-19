@@ -400,6 +400,8 @@ async def test_local_member_stays_restricted_when_admin_requirement_is_disabled(
         path=str(outside_file),
     )
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "Read access is restricted for this user." in result
     assert "host secret" not in result
 
@@ -472,6 +474,8 @@ async def test_restricted_local_member_cannot_write_plugin_provided_skill(
         content="# Changed\n",
     )
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "Write access is restricted for this user." in result
     assert "data/plugins/*/skills" not in result
     assert plugin_skill.read_text(encoding="utf-8") == "# Demo Skill\n"
@@ -512,6 +516,10 @@ async def test_restricted_local_member_cannot_modify_locally_installed_skill(
     )
 
     assert read_result == "# Demo Skill\n"
+    assert write_result.isError is True
+    write_result = write_result.content[0].text
+    assert edit_result.isError is True
+    edit_result = edit_result.content[0].text
     assert "Write access is restricted for this user." in write_result
     assert "Write access is restricted for this user." in edit_result
     assert "data/skills" not in write_result
@@ -566,6 +574,10 @@ async def test_restricted_local_member_rejects_workspace_hardlink_alias(
         content="changed\n",
     )
 
+    assert read_result.isError is True
+    read_result = read_result.content[0].text
+    assert write_result.isError is True
+    write_result = write_result.content[0].text
     assert "multiple hard links" in read_result
     assert "may alias content outside allowed directories" in read_result
     assert "multiple hard links" in write_result
@@ -599,6 +611,8 @@ async def test_isolation_failure_does_not_expand_workspace_file_access(
 
     result = await tool_type().call(context, path=str(outside), **arguments)
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "access is restricted for this user" in result
     assert "original secret" not in result
     assert outside.read_text(encoding="utf-8") == "original secret"
@@ -642,6 +656,8 @@ async def test_restricted_file_access_preserves_files_when_native_open_fails(
         **arguments,
     )
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "Native workspace open denied" in result
     assert "original secret" not in result
     assert existing_file.read_text(encoding="utf-8") == "original secret\n"
@@ -850,6 +866,8 @@ async def test_file_read_tool_rejects_large_full_text_read_before_local_stream_r
         path="large.txt",
     )
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "text file exceeds 262144 bytes" in result
     assert "Use `offset` and `limit`" in result
 
@@ -1050,6 +1068,8 @@ async def test_restricted_local_document_conversion_rejects_symlinked_output_dir
         path="manual.pdf",
     )
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "symbolic link" in result
     assert list(outside_dir.rglob("text.txt")) == []
 
@@ -1102,6 +1122,8 @@ async def test_file_read_tool_rejects_directory_with_clear_message(
         path="my-directory",
     )
 
+    assert result.isError is True
+    result = result.content[0].text
     assert "is a directory, not a file" in result
     assert "my-directory" in result
     assert "'astrbot_execute_shell'" in result

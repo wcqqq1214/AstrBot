@@ -475,11 +475,15 @@ class SlackAdapter(Platform):
                 f"不支持的连接模式: {self.connection_mode}，请使用 'socket' 或 'webhook'",
             )
 
-    async def _handle_webhook_event(self, event_data: dict) -> None:
+    async def _handle_webhook_event(self, event_data: dict) -> bool | None:
         """Convert and enqueue an Events API delivery from either transport.
 
         Args:
             event_data: Slack payload containing the event and its stable event ID.
+
+        Returns:
+            False while another delivery is pending, otherwise None. Webhook
+            callers must not acknowledge pending work as successfully received.
         """
         if event_data.get("type") == "block_actions":
             abm = await self.convert_button_interaction(event_data)
@@ -513,10 +517,9 @@ class SlackAdapter(Platform):
                     break
                 self._seen_event_ids.popitem(last=False)
             if event_id:
-                if (
-                    event_id in self._pending_event_ids
-                    or event_id in self._seen_event_ids
-                ):
+                if event_id in self._pending_event_ids:
+                    return False
+                if event_id in self._seen_event_ids:
                     return
                 self._pending_event_ids.add(event_id)
             try:

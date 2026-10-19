@@ -972,6 +972,16 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
         "python_error",
         "python_error_fallback",
         "python_output",
+        "file_denied",
+        "file_missing",
+        "file_missing_fallback",
+        "file_binary",
+        "file_write",
+        "file_edit",
+        "file_search",
+        "file_upload",
+        "file_download",
+        "file_output",
         "timeout",
         "missing",
         "off",
@@ -1002,6 +1012,7 @@ async def test_task_cards_through_real_tool_runner_and_respond(
         "shell_output",
         "python_output",
         "session_terminate",
+        "file_output",
     }
     stream.event.native_task_cards = outcome != "off"
     enabled = outcome not in {"off", "hidden", "tts"}
@@ -1135,6 +1146,85 @@ async def test_task_cards_through_real_tool_runner_and_respond(
         else:
             tool, tool_args = shell.LocalExecuteShellTool(), {"command": "echo example"}
 
+    if outcome.startswith("file_"):
+        from astrbot.core.computer.booters.local import LocalBooter
+        from astrbot.core.tools.computer_tools import fs
+
+        stream.event.role = "admin"
+        config_holder.get_config = lambda **_: {
+            "provider_settings": {
+                "computer_use_runtime": "local",
+                "computer_use_local_permissions": {
+                    "admin": {
+                        "filesystem_scope": "none"
+                        if outcome == "file_denied"
+                        else "host"
+                    }
+                },
+            }
+        }
+        booter = LocalBooter()
+        booter.upload_file = AsyncMock(
+            return_value={"success": False, "message": "upload refused"}
+        )
+        booter.download_file = AsyncMock(side_effect=OSError("download refused"))
+        monkeypatch.setattr(fs, "get_booter", AsyncMock(return_value=booter))
+        monkeypatch.setattr(fs, "get_astrbot_temp_path", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            fs, "workspace_root_for_context", AsyncMock(return_value=tmp_path)
+        )
+        sample = tmp_path / "sample.txt"
+        sample.write_text("Error: example content read successfully")
+        binary = tmp_path / "sample.bin"
+        binary.write_bytes(b"\x00" * 128)
+        tool, tool_args, expected_file_text = {
+            "file_denied": (
+                fs.FileReadTool(),
+                {"path": str(sample)},
+                "Permission denied",
+            ),
+            "file_missing": (
+                fs.FileReadTool(),
+                {"path": str(tmp_path / "missing")},
+                "Error reading file",
+            ),
+            "file_binary": (
+                fs.FileReadTool(),
+                {"path": str(binary)},
+                "binary files are not supported",
+            ),
+            "file_write": (
+                fs.FileWriteTool(),
+                {"path": str(tmp_path), "content": "x"},
+                "Error writing file",
+            ),
+            "file_edit": (
+                fs.FileEditTool(),
+                {"path": str(sample), "old": "absent", "new": "x"},
+                "Error editing file",
+            ),
+            "file_search": (
+                fs.GrepTool(),
+                {"pattern": "[", "path": str(sample)},
+                "Error searching files",
+            ),
+            "file_upload": (
+                fs.FileUploadTool(),
+                {"local_path": str(sample)},
+                "upload refused",
+            ),
+            "file_download": (
+                fs.FileDownloadTool(),
+                {"remote_path": "/missing"},
+                "download refused",
+            ),
+            "file_output": (
+                fs.FileReadTool(),
+                {"path": str(sample)},
+                "Error: example content read successfully",
+            ),
+        }[outcome]
+
     calls = 0
 
     async def model(**kwargs):
@@ -1243,6 +1333,11 @@ async def test_task_cards_through_real_tool_runner_and_respond(
             else "error: example text printed successfully"
         )
         assert expected_text in str(results[0].content)
+        assert calls == 2
+    if outcome.startswith("file_"):
+        results = [m for m in runner.run_context.messages if m.role == "tool"]
+        assert len(results) == 1
+        assert expected_file_text in str(results[0].content)
         assert calls == 2
     if outcome.startswith("direct_"):
         assert calls == 1  # Direct delivery still ends the loop, even on failure.
