@@ -653,6 +653,17 @@ class FunctionToolExecutor(BaseFunctionToolExecutor[AstrAgentContext]):
                                         f"Tool 直接发送消息失败: {e}",
                                         exc_info=True,
                                     )
+                                    # Report failure before the terminating None;
+                                    # do not retry an unconfirmed delivery.
+                                    yield mcp.types.CallToolResult(
+                                        isError=True,
+                                        content=[
+                                            mcp.types.TextContent(
+                                                type="text",
+                                                text=f"Direct tool delivery failed or is unconfirmed: {e!s}",
+                                            )
+                                        ],
+                                    )
                         yield None
                 except asyncio.TimeoutError:
                     raise Exception(

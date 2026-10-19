@@ -954,7 +954,19 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
 @pytest.mark.parametrize("stream", [True], indirect=True)
 @pytest.mark.parametrize(
     "outcome",
-    ["success", "exception", "mcp_error", "timeout", "missing", "off", "hidden", "tts"],
+    [
+        "success",
+        "exception",
+        "mcp_error",
+        "timeout",
+        "missing",
+        "off",
+        "hidden",
+        "tts",
+        "direct_success",
+        "direct_rejected",
+        "direct_lost",
+    ],
 )
 async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
     from mcp.types import CallToolResult, TextContent
@@ -973,6 +985,11 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
     async def api(method, **kwargs):
         body = kwargs["json"]
         requests.append((method, body))
+        if "blocks" in body:
+            if outcome == "direct_rejected":
+                raise SlackApiError("image rejected", {"error": "channel_not_found"})
+            if outcome == "direct_lost":
+                raise TimeoutError("image accepted but response lost")
         return {"ok": True, "ts": body.get("ts", str(len(requests)))}
 
     stream.api.side_effect = api
@@ -986,6 +1003,13 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
             return CallToolResult(
                 isError=True, content=[TextContent(type="text", text="failed")]
             )
+        if outcome.startswith("direct_"):
+            event.set_result(
+                MessageEventResult(
+                    chain=[Image.fromURL("https://example.com/tool.png")]
+                )
+            )
+            return None
         await event.send(MessageChain([Image.fromURL("https://example.com/tool.png")]))
         return "success"
 
@@ -1072,10 +1096,21 @@ async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
         ]
         assert [chunk["status"] for chunk in updates] == [
             "in_progress",
-            "complete" if outcome == "success" else "error",
+            "complete" if outcome in {"success", "direct_success"} else "error",
         ]
         assert len({chunk["id"] for chunk in updates}) == 1
-    assert any(body.get("markdown_text") == "Final" for _, body in requests)
+    if outcome.startswith("direct_"):
+        assert calls == 1  # Direct delivery still ends the loop, even on failure.
+        assert sum("blocks" in body for _, body in requests) == 1
+        results = [m for m in runner.run_context.messages if m.role == "tool"]
+        assert len(results) == 1
+        if outcome != "direct_success":
+            assert "Direct tool delivery failed or is unconfirmed" in str(
+                results[0].content
+            )
+        assert not any(body.get("markdown_text") == "Final" for _, body in requests)
+    else:
+        assert any(body.get("markdown_text") == "Final" for _, body in requests)
     if outcome in {"success", "off", "hidden", "tts"}:
         media = next(i for i, (_, body) in enumerate(requests) if "blocks" in body)
         final = next(

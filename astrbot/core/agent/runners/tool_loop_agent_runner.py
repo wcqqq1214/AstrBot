@@ -1554,6 +1554,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         ):
             self._tool_execution_started = False
             tool_result_blocks_start = len(tool_call_result_blocks)
+            tool_failed = False
             tool_call_streak = self._track_tool_call_streak(
                 func_tool_name,
                 func_tool_args,
@@ -1663,6 +1664,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     if isinstance(resp, CallToolResult):
                         res = resp
                         _final_resp = resp
+                        tool_failed |= bool(res.isError)
                         if not res.content:
                             _append_tool_call_result(
                                 func_tool_id,
@@ -1745,13 +1747,15 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         )
                         self._transition_state(AgentState.DONE)
                         self.stats.end_time = time.time()
-                        _append_tool_call_result(
-                            func_tool_id,
-                            "The tool has no return value, or has sent the result directly to the user."
-                            + self._build_repeated_tool_call_guidance(
-                                func_tool_name, tool_call_streak
-                            ),
-                        )
+                        # Preserve a prior delivery failure instead of adding a success-like result.
+                        if not tool_failed:
+                            _append_tool_call_result(
+                                func_tool_id,
+                                "The tool has no return value, or has sent the result directly to the user."
+                                + self._build_repeated_tool_call_guidance(
+                                    func_tool_name, tool_call_streak
+                                ),
+                            )
                     else:
                         # 不应该出现其他类型
                         logger.warning(
