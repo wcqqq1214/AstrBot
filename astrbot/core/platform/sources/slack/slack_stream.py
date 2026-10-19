@@ -3,6 +3,7 @@
 import asyncio
 import time
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from copy import copy
 from typing import TYPE_CHECKING
 
@@ -214,44 +215,89 @@ class SlackMessageStream:
         Args:
             generator: Ordered text deltas and message components.
         """
+        queue: asyncio.Queue[MessageChain] = asyncio.Queue()
+        consumed = asyncio.Event()
+
+        async def produce() -> None:
+            """Yield one chunk at a time, closing generation on cancellation."""
+            # Keep generator context in one task and do not cross a tool boundary
+            # until its preceding message has been fully processed.
+            async with aclosing(generator):
+                async for chain in generator:
+                    await queue.put(chain)
+                    await consumed.wait()
+                    consumed.clear()
+
+        producer = asyncio.create_task(produce())
+        pending = None
         reasoning = False
         try:
-            async for chain in generator:
-                if chain.type in {"break", "aborted"}:
-                    await self._flush(final=True)
-                    if chain.type == "aborted":
-                        break
+            while True:
+                if pending is None:
+                    pending = asyncio.create_task(queue.get())
+                timeout = None
+                if self.text.strip() and self.text != self.sent:
+                    timeout = max(0.0, self.last_update + 1.5 - time.monotonic())
+                done, _ = await asyncio.wait(
+                    {pending, producer},
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    await self._flush()
                     continue
-                if chain.type in {"audio_chunk", "tool_call", "agent_stats"}:
-                    continue
-                # Upstream only emits reasoning when the user enables it. Keep
-                # it separate from the answer without altering either Markdown.
-                if chain.chain and (chain.type == "reasoning") != reasoning:
-                    await self._flush(final=True)
-                    reasoning = chain.type == "reasoning"
-                for component in chain.chain:
-                    if isinstance(component, Reply):
-                        continue
-                    if isinstance(component, (Plain, At)):
-                        text = (
-                            component.text
-                            if isinstance(component, Plain)
-                            else f"<@{component.qq}>"
-                        )
-                        # Slack truncates text above 40k. Split oversized text
-                        # while preserving every source character.
-                        while text:
-                            remaining = 39_000 - len(self.text)
-                            self.text += text[:remaining]
-                            text = text[remaining:]
-                            if text:
-                                await self._flush(final=True)
-                        await self._flush()
-                    else:
+                if producer in done:
+                    producer.result()
+                    break
+                chain = pending.result()
+                pending = None
+                try:
+                    if chain.type in {"break", "aborted"}:
                         await self._flush(final=True)
-                        await self.event.send(chain.derive([component]))
+                        if chain.type == "aborted":
+                            break
+                        continue
+                    if chain.type in {"audio_chunk", "tool_call", "agent_stats"}:
+                        continue
+                    # Upstream only emits reasoning when the user enables it. Keep
+                    # it separate from the answer without altering either Markdown.
+                    if chain.chain and (chain.type == "reasoning") != reasoning:
+                        await self._flush(final=True)
+                        reasoning = chain.type == "reasoning"
+                    for component in chain.chain:
+                        if isinstance(component, Reply):
+                            continue
+                        if isinstance(component, (Plain, At)):
+                            text = (
+                                component.text
+                                if isinstance(component, Plain)
+                                else f"<@{component.qq}>"
+                            )
+                            # Slack truncates text above 40k. Split oversized text
+                            # while preserving every source character.
+                            while text:
+                                remaining = 39_000 - len(self.text)
+                                self.text += text[:remaining]
+                                text = text[remaining:]
+                                if text:
+                                    await self._flush(final=True)
+                            await self._flush()
+                        else:
+                            await self._flush(final=True)
+                            await self.event.send(chain.derive([component]))
+                finally:
+                    if chain.type != "aborted":
+                        consumed.set()
             await self._flush(final=True)
         finally:
+            producer.cancel()
+            if pending is not None:
+                pending.cancel()
+            await asyncio.gather(
+                producer,
+                *([pending] if pending is not None else []),
+                return_exceptions=True,
+            )
             # Cancellation or generator failure must not leave a typing stream
             # open. Do not repost on errors with an unknown delivery outcome.
             if self.open and self.ts:

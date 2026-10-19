@@ -1,5 +1,7 @@
 import asyncio
+import time
 import wave
+from contextvars import ContextVar
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -281,6 +283,67 @@ async def test_stream_closes_on_early_termination(stream, ending):
         if stream.native
         else ["chat.postMessage"]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["finish", "cancel", "send_error"])
+async def test_paused_generation_flushes_without_advancing_boundaries(
+    stream, monkeypatch, ending
+):
+    # Use the real clock: the next delta remains blocked until Slack is updated.
+    monkeypatch.setattr("astrbot.core.platform.sources.slack.slack_stream.time", time)
+    flushed = asyncio.Event()
+    closed = asyncio.Event()
+    never = asyncio.Event()
+    context = ContextVar("stream_test_context", default=None)
+    methods = []
+
+    async def api(method, **kwargs):
+        methods.append(method)
+        if method in {"chat.update", "chat.appendStream"}:
+            flushed.set()
+            if ending == "send_error":
+                # Editing recovery may also fail; the pending producer must stop.
+                raise RuntimeError("Update rejected")
+        return {"ok": True, "ts": "1.0"}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        token = context.set("same generation context")
+        try:
+            yield MessageChain([Plain("- Parent\n")])
+            yield MessageChain([Plain("  - Child")])
+            await asyncio.wait_for(flushed.wait(), timeout=3)
+            if ending != "finish":
+                await never.wait()
+            yield MessageChain([], type="break")
+            assert methods[-1] == (
+                "chat.stopStream" if stream.native else "chat.update"
+            )
+            yield MessageChain([Image.fromURL("https://example.com/image.png")])
+        finally:
+            context.reset(token)
+            closed.set()
+
+    sending = asyncio.create_task(stream.event.send_streaming(chunks()))
+    try:
+        await asyncio.wait_for(flushed.wait(), timeout=3)
+        if ending == "cancel":
+            sending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await sending
+        elif ending == "send_error":
+            with pytest.raises(RuntimeError, match="Update rejected"):
+                await sending
+        else:
+            await sending
+            assert methods[-1] == "chat.postMessage"
+            assert stream.api.await_args.kwargs["json"]["blocks"][0]["type"] == "image"
+        assert closed.is_set()
+    finally:
+        sending.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
