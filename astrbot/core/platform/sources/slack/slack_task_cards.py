@@ -35,6 +35,42 @@ class SlackTaskCards:
         self.fallback = False
         self.fallback_ts: str | None = None
 
+    def _fallback_text(self, *, closing: bool = False) -> str:
+        """Render recent tasks and summarize older states without discarding them.
+
+        Args:
+            closing: Label unfinished tasks as unconfirmed during cleanup.
+
+        Returns:
+            Progress text with at most eight task rows and one summary row.
+        """
+        statuses = {
+            "in_progress": "状态未确认" if closing else "进行中",
+            "complete": "已完成",
+            "error": "失败",
+        }
+        tasks = list({**self.tasks, **self.pending}.values())
+        lines = ["AstrBot 工具进度"]
+        if len(tasks) > 8:
+            older = tasks[:-8]
+            counts = dict.fromkeys(statuses, 0)
+            for task in older:
+                counts[task["status"]] += 1
+            lines.append(
+                f"较早 {len(older)} 项："
+                + " · ".join(
+                    f"{statuses[status]} {count}"
+                    for status, count in counts.items()
+                    if count
+                )
+            )
+        for task in tasks[-8:]:
+            title = " ".join(task["title"].split())
+            if len(title) > 120:
+                title = title[:117].rstrip() + "..."
+            lines.append(f"• {title}：{statuses[task['status']]}")
+        return "\n".join(lines)
+
     async def _request(self, method: str, **kwargs):
         """Send optional progress without sleeping or retrying SDK writes.
 
@@ -183,16 +219,6 @@ class SlackTaskCards:
                 )
                 await self.close()
         if self.fallback:
-            statuses = {
-                "in_progress": "进行中",
-                "complete": "已完成",
-                "error": "失败",
-            }
-            tasks = {**self.tasks, **self.pending}
-            text = "AstrBot 工具进度\n" + "\n".join(
-                f"• {item['title']}：{statuses[item['status']]}"
-                for item in tasks.values()
-            )
             try:
                 response = await self._request(
                     "chat_update" if self.fallback_ts else "chat_postMessage",
@@ -202,7 +228,7 @@ class SlackTaskCards:
                         if self.fallback_ts
                         else {"thread_ts": raw["thread_ts"]}
                     ),
-                    text=text,
+                    text=self._fallback_text(),
                     parse="full",
                 )
                 self.fallback_ts = response["ts"]
@@ -232,21 +258,12 @@ class SlackTaskCards:
         ):
             # Attempt cleanup once; never resume progress after an uncertain write.
             self.disabled = True
-            statuses = {
-                "in_progress": "状态未确认",
-                "complete": "已完成",
-                "error": "失败",
-            }
             try:
                 await self._request(
                     "chat_update",
                     channel=self.event.message_obj.raw_message["channel"],
                     ts=self.fallback_ts,
-                    text="AstrBot 工具进度\n"
-                    + "\n".join(
-                        f"• {task['title']}：{statuses[task['status']]}"
-                        for task in {**self.tasks, **self.pending}.values()
-                    ),
+                    text=self._fallback_text(closing=True),
                     parse="full",
                 )
             except Exception:

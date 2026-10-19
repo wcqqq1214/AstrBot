@@ -1671,6 +1671,121 @@ async def test_task_card_text_fallback_edits_one_message_through_respond(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize("ending", ["complete", "aborted", "rate_limited"])
+async def test_long_text_progress_stays_bounded_through_respond(
+    stream, monkeypatch, ending
+):
+    stream.event.native_task_cards = True
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_task_cards.time",
+        SimpleNamespace(monotonic=lambda: stream.clock.now),
+    )
+    requests = []
+    progress = []
+    reject_next = False
+
+    async def api(method, **kwargs):
+        nonlocal reject_next
+        body = kwargs["json"]
+        requests.append((method, body))
+        if body.get("task_display_mode") == "plan":
+            raise SlackApiError("cards unavailable", {"error": "invalid_arguments"})
+        if body.get("text", "").startswith("AstrBot 工具进度"):
+            progress.append((method, body["text"]))
+            if method == "chat.update":
+                assert body["ts"] == "progress"
+            if reject_next:
+                reject_next = False
+                raise SlackApiError("limited", {"error": "ratelimited"})
+            return {"ok": True, "ts": "progress"}
+        return {"ok": True, "ts": body.get("ts", "answer")}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        nonlocal reject_next
+        for number in range(1, 31):
+            yield MessageChain(
+                [
+                    Json(
+                        data={
+                            "id": str(number),
+                            "name": f"tool_{number}"
+                            if number < 30
+                            else "long\n\t" + "x" * 200,
+                        }
+                    )
+                ],
+                type="tool_call",
+            )
+            if number == 30:
+                assert progress[-1][1].splitlines()[1] == (
+                    "较早 22 项：进行中 1 · 已完成 20 · 失败 1"
+                )
+            if number != 1 and not (number == 30 and ending == "aborted"):
+                yield MessageChain(
+                    [Json(data={"id": str(number), "is_error": number in {2, 23}})],
+                    type="tool_call_result",
+                )
+        if ending == "aborted":
+            yield MessageChain([], type="aborted")
+            return
+        # An old task can finish after its detail has left the visible window.
+        reject_next = ending == "rate_limited"
+        yield MessageChain(
+            [Json(data={"id": "1", "is_error": False})], type="tool_call_result"
+        )
+        stream.clock.now = 2
+        yield MessageChain([Image.fromURL("https://example.com/image.png")])
+        yield MessageChain([Plain("Final")])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    await stage.process(stream.event)
+
+    assert [method for method, _ in progress].count("chat.postMessage") == 1
+    assert all(len(text.splitlines()) <= 10 for _, text in progress)
+    # Eight tasks still use the original layout; only the ninth adds a summary.
+    eight = next(text for _, text in progress if text.endswith("tool_8：进行中"))
+    assert len(eight.splitlines()) == 9 and "较早" not in eight
+    final = progress[-1][1].splitlines()
+    assert final[1] == (
+        "较早 22 项：状态未确认 1 · 已完成 20 · 失败 1"
+        if ending == "aborted"
+        else "较早 22 项：已完成 21 · 失败 1"
+    )
+    assert final[2:9] == [
+        f"• tool_{number}：{'失败' if number == 23 else '已完成'}"
+        for number in range(23, 30)
+    ]
+    assert final[9] == (
+        "• long "
+        + "x" * 112
+        + "...："
+        + ("状态未确认" if ending == "aborted" else "已完成")
+    )
+    if ending != "aborted":
+        media = next(i for i, (_, body) in enumerate(requests) if body.get("blocks"))
+        answer = next(
+            i
+            for i, (_, body) in enumerate(requests)
+            if body.get("markdown_text") == "Final"
+        )
+        assert media < answer
+    if ending == "rate_limited":
+        # Cleanup includes the unacknowledged old result after the cooldown.
+        assert progress[-2][1] == progress[-1][1]
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
 @pytest.mark.parametrize("ending", ["cancel", "error", "aborted", "rejected", "lost"])
 async def test_text_progress_closes_pending_tasks_through_respond(stream, ending):
     stream.event.native_task_cards = True
