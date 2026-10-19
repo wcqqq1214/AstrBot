@@ -1221,6 +1221,100 @@ async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, f
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize(
+    "stalled", ["start", "append", "stop", "text_post", "text_update", "text_close"]
+)
+async def test_stalled_progress_is_bounded_through_respond(stream, monkeypatch, stalled):
+    stream.event.native_task_cards = True
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_task_cards._PROGRESS_REQUEST_TIMEOUT",
+        0.1,
+    )
+    release = asyncio.Event()
+    requests = []
+    stalled_requests = []
+    text_mode = stalled.startswith("text_")
+    target = {
+        "start": "chat.startStream",
+        "append": "chat.appendStream",
+        "stop": "chat.stopStream",
+        "text_post": "chat.postMessage",
+        "text_update": "chat.update",
+        "text_close": "chat.update",
+    }[stalled]
+
+    async def handle(request):
+        method = request.match_info["method"]
+        body = await request.json()
+        requests.append((method, body))
+        if text_mode and body.get("task_display_mode"):
+            return web.json_response({"ok": False, "error": "invalid_arguments"})
+        progress = (
+            body.get("task_display_mode")
+            or body.get("ts") == "progress"
+            or body.get("text", "").startswith("AstrBot 工具进度")
+        )
+        if progress and method == target:
+            stalled_requests.append(body)
+            # The request arrived, but its write outcome is unknown to the client.
+            await release.wait()
+        return web.json_response(
+            {"ok": True, "ts": "progress" if progress else "answer"}
+        )
+
+    async def chunks():
+        yield MessageChain(
+            [Json(data={"id": "probe", "name": "probe"})], type="tool_call"
+        )
+        # Direct tool delivery must resume even if posting progress never returns.
+        await stream.event.send(
+            MessageChain([Image.fromURL("https://example.com/tool.png")])
+        )
+        if stalled != "text_close":
+            yield MessageChain(
+                [Json(data={"id": "probe", "is_error": False})],
+                type="tool_call_result",
+            )
+        yield MessageChain([Plain("Final")])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    app = web.Application()
+    app.router.add_post("/{method}", handle)
+    async with TestServer(app) as server:
+        client = AsyncWebClient(token="test", base_url=str(server.make_url("/")))
+        client.proxy = None
+        stream.event.web_client = client
+        original_timeout = client.timeout
+        original_retries = list(client.retry_handlers)
+        try:
+            await asyncio.wait_for(stage.process(stream.event), timeout=3)
+        finally:
+            release.set()
+    assert client.timeout == original_timeout
+    assert client.retry_handlers == original_retries
+    assert len(stalled_requests) == 1
+    assert sum(bool(body.get("task_display_mode")) for _, body in requests) == 1
+    assert sum(
+        method == "chat.postMessage" and "AstrBot 工具进度" in body.get("text", "")
+        for method, body in requests
+    ) == int(text_mode)
+    media = next(i for i, (_, body) in enumerate(requests) if "blocks" in body)
+    final = next(
+        i for i, (_, body) in enumerate(requests) if body.get("markdown_text") == "Final"
+    )
+    assert media < final
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
 @pytest.mark.parametrize("limited", ["start", "append", "text_post", "text_update"])
 @pytest.mark.parametrize("recover", [False, True])
 async def test_progress_rate_limit_coalesces_without_waiting_through_respond(

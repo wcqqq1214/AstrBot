@@ -117,6 +117,11 @@ cooldown. On completion, native cards attempt to seal with the final states. Tex
 progress still in cooldown is left unchanged; no background retry is scheduled.
 Answer delivery keeps its existing rate-limit handling.
 
+Each task-card or text-progress request, including cleanup, has a 3-second timeout.
+A timeout is treated as an unknown delivery outcome, without retrying or creating
+another progress message. Tool execution and answer delivery continue. Answer
+requests keep their existing timeout behavior.
+
 ## Test the Connection
 
 Enter the Slack workspace you just added, navigate to the channel where you want to use the bot, then @ mention the app you just created. Click the Add button in the message subsequently sent by Slackbot to add it to the workspace. Then, @ mention the app and type `/help`. If it responds successfully, the test is successful.

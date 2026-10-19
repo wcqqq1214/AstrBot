@@ -1,5 +1,6 @@
 """Optional task progress, independent of Slack answer delivery."""
 
+import asyncio
 import time
 from copy import copy
 from typing import TYPE_CHECKING
@@ -12,6 +13,8 @@ from astrbot.api.message_components import Json
 
 if TYPE_CHECKING:
     from .slack_event import SlackMessageEvent
+
+_PROGRESS_REQUEST_TIMEOUT = 3.0
 
 
 class SlackTaskCards:
@@ -43,11 +46,15 @@ class SlackTaskCards:
 
         Raises:
             SlackApiError: Slack rejected the request; rate limits set a cooldown.
+            asyncio.TimeoutError: The progress request exceeded its time budget.
         """
         client = copy(self.event.web_client)
         client.retry_handlers = []
         try:
-            return await getattr(client, method)(**kwargs)
+            # Optional progress must not hold up tool execution or turn cleanup.
+            return await asyncio.wait_for(
+                getattr(client, method)(**kwargs), timeout=_PROGRESS_REQUEST_TIMEOUT
+            )
         except SlackApiError as exc:
             if exc.response.get("error") in {"ratelimited", "rate_limited"}:
                 headers = getattr(exc.response, "headers", {}) or {}
