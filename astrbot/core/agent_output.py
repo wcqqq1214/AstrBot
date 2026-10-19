@@ -120,6 +120,13 @@ async def present_turn(
         Platform-neutral message chains ready for the normal delivery pipeline.
     """
     event = turn.input.event
+    native_task_cards = (
+        streaming
+        and not stream_to_general
+        and show_tool_use
+        and getattr(event, "native_task_cards", False) is True
+        and event.get_extra("action_type") != "live"
+    )
     names: dict[str, tuple[str, str]] = {}
     buffered = MessageChain()
     buffer = buffer_intermediate_messages and not streaming and not stream_to_general
@@ -245,6 +252,19 @@ async def present_turn(
                     "ts": output.created_at.timestamp(),
                 }
                 event.trace.record("agent_tool_call", tool_name=info)
+                if native_task_cards:
+                    yield MessageChain(
+                        type="tool_call",
+                        chain=[
+                            Json(
+                                data={
+                                    "id": payload.execution_id,
+                                    "name": payload.name,
+                                }
+                            )
+                        ],
+                    )
+                    continue
                 if streaming and show_tool_use:
                     yield MessageChain(chain=[], type="break")
                 if event.get_platform_name() == "webchat":
@@ -272,6 +292,30 @@ async def present_turn(
                 if not text and payload.error:
                     text = payload.error.message
                 event.trace.record("agent_tool_result", tool_result=text)
+                if native_task_cards:
+                    task_id = (
+                        payload.execution_id
+                        if isinstance(payload, ToolFinished)
+                        else payload.call_id
+                    )
+                    if isinstance(payload, ToolRejected):
+                        yield MessageChain(
+                            type="tool_call",
+                            chain=[Json(data={"id": task_id, "name": payload.name})],
+                        )
+                    yield MessageChain(
+                        type="tool_call_result",
+                        chain=[
+                            Json(
+                                data={
+                                    "id": task_id,
+                                    "is_error": isinstance(payload, ToolRejected)
+                                    or payload.status != TurnStatus.COMPLETED,
+                                }
+                            )
+                        ],
+                    )
+                    continue
                 if event.get_platform_name() == "webchat":
                     await event.send(
                         MessageChain(

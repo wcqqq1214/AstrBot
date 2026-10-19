@@ -497,6 +497,7 @@ CONFIG_METADATA_2 = {
                         "app_token": "",
                         "signing_secret": "",
                         "slack_connection_mode": "socket",  # webhook, socket
+                        "slack_native_task_cards": False,
                         "unified_webhook_mode": True,
                         "webhook_uuid": "",
                         "slack_webhook_host": "0.0.0.0",
@@ -747,6 +748,11 @@ CONFIG_METADATA_2 = {
                         "type": "string",
                         "options": ["webhook", "socket"],
                         "hint": "The connection mode for Slack. `webhook` uses a webhook server, `socket` uses Slack's Socket Mode.",
+                    },
+                    "slack_native_task_cards": {
+                        "description": "Slack Native Task Cards",
+                        "type": "bool",
+                        "hint": "Show native tool progress in threaded streaming replies. Requires tool-use display to be enabled.",
                     },
                     "slack_webhook_host": {
                         "description": "Slack Webhook Host",

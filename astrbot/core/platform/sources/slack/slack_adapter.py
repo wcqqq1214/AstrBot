@@ -547,6 +547,7 @@ class SlackAdapter(Platform):
             platform_meta=self.meta(),
             session_id=message.session_id,
             web_client=self.web_client,
+            native_task_cards=self.config.get("slack_native_task_cards", False),
         )
 
     async def handle_msg(self, message: AstrBotMessage) -> None:

@@ -77,6 +77,9 @@ class SlackMessageStream:
     """
 
     def __init__(self, event: "SlackMessageEvent") -> None:
+        # Task cards share this module's delivery policy; import after initialization.
+        from .slack_task_cards import SlackTaskCards
+
         self.event = event
         self.client = event.web_client
         raw = getattr(event.message_obj, "raw_message", None)
@@ -100,6 +103,7 @@ class SlackMessageStream:
         self.lock = asyncio.Lock()
         self.task = asyncio.current_task()
         self.error: Exception | asyncio.CancelledError | None = None
+        self.task_cards = SlackTaskCards(event) if event.native_task_cards else None
 
     async def _flush(self, final: bool = False) -> None:
         """Publish accumulated text, sealing it at a content boundary.
@@ -317,6 +321,13 @@ class SlackMessageStream:
                             if chain.type == "aborted":
                                 break
                             continue
+                        if self.task_cards is not None and chain.type in {
+                            "tool_call",
+                            "tool_call_result",
+                        }:
+                            await self._flush(final=True)
+                            await self.task_cards.update(chain)
+                            continue
                         if chain.type in {"audio_chunk", "tool_call", "agent_stats"}:
                             continue
                         # Upstream only emits reasoning when the user enables it. Keep
@@ -356,6 +367,8 @@ class SlackMessageStream:
                 *([pending] if pending is not None else []),
                 return_exceptions=True,
             )
+            if self.task_cards is not None:
+                await self.task_cards.close()
             # Cancellation or generator failure must not leave a typing stream
             # open. Do not repost on errors with an unknown delivery outcome.
             if self.open and self.ts:

@@ -88,6 +88,25 @@ After enabling, under Subscribe to bot events below, click Add Bot User Event an
 
 After adding the events, click `Save Changes` at the bottom of the page to save the subscriptions before testing below.
 
+## Native Tool Progress Cards (Experimental)
+
+Enable **Slack Native Task Cards** (`slack_native_task_cards`, off by default)
+in the Slack adapter settings. Also enable streaming replies and tool-use display
+in the active configuration. For replies inside an existing thread, AstrBot shows
+tool starts and results in one native plan card, separate from the answer. Cards
+show tool names and status, without arguments or result contents.
+
+Top-level channel messages, non-streaming replies, and live TTS keep their existing
+tool-progress behavior. Disabling tool-use display also hides the cards. Exceptions,
+timeouts, and explicit tool errors produce an error status; interrupted tasks are
+not marked complete. Background tools are complete when submission returns, not
+when their background work finishes.
+
+Explicit Slack capability or format rejections fall back to text progress. Other
+delivery failures disable card updates for that reply without retrying uncertain
+writes or suppressing the answer. An expired card stream falls back to text;
+automatic card reopening is not implemented.
+
 ## Test the Connection
 
 Enter the Slack workspace you just added, navigate to the channel where you want to use the bot, then @ mention the app you just created. Click the Add button in the message subsequently sent by Slackbot to add it to the workspace. Then, @ mention the app and type `/help`. If it responds successfully, the test is successful.

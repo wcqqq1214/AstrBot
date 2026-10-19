@@ -47,10 +47,18 @@ class SlackMessageEvent(AstrMessageEvent):
         platform_meta,
         session_id,
         web_client: AsyncWebClient,
+        native_task_cards: bool = False,
     ) -> None:
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.web_client = web_client
         self._stream: SlackMessageStream | None = None
+        raw = getattr(message_obj, "raw_message", None)
+        self.native_task_cards = bool(
+            native_task_cards
+            and isinstance(raw, dict)
+            and raw.get("thread_ts")
+            and callable(getattr(web_client, "chat_startStream", None))
+        )
         self._agent_turn: AgentTurn | None = None
         self._output_task: asyncio.Task | None = None
         self._output_consumed = 0

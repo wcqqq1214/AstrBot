@@ -15,7 +15,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import At, Image, Plain, Record, Reply
+from astrbot.api.message_components import At, Image, Json, Plain, Record, Reply
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -948,3 +948,270 @@ async def test_tool_timeout_during_flush_does_not_replay_accepted_text(stream):
     )
     assert generator_closed.is_set()
     assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize(
+    "outcome",
+    ["success", "exception", "mcp_error", "timeout", "missing", "off", "hidden", "tts"],
+)
+async def test_task_cards_through_real_tool_runner_and_respond(stream, outcome):
+    from mcp.types import CallToolResult, TextContent
+
+    from astrbot.core.agent.hooks import BaseAgentRunHooks
+    from astrbot.core.agent.run_context import ContextWrapper
+    from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+    from astrbot.core.agent.tool import FunctionTool, ToolSet
+    from astrbot.core.astr_agent_runtime.tool_executor import FunctionToolExecutor
+    from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+
+    stream.event.native_task_cards = outcome != "off"
+    enabled = outcome not in {"off", "hidden", "tts"}
+    requests = []
+
+    async def api(method, **kwargs):
+        body = kwargs["json"]
+        requests.append((method, body))
+        return {"ok": True, "ts": body.get("ts", str(len(requests)))}
+
+    stream.api.side_effect = api
+
+    async def handler(event):
+        if outcome == "exception":
+            raise ValueError("controlled tool failure")
+        if outcome == "timeout":
+            await asyncio.Event().wait()
+        if outcome == "mcp_error":
+            return CallToolResult(
+                isError=True, content=[TextContent(type="text", text="failed")]
+            )
+        await event.send(MessageChain([Image.fromURL("https://example.com/tool.png")]))
+        return "success"
+
+    calls = 0
+
+    async def model(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield LLMResponse(role="assistant", completion_text="Before", is_chunk=True)
+            yield LLMResponse(
+                role="assistant",
+                completion_text="Before",
+                tools_call_name=["missing" if outcome == "missing" else "probe"],
+                tools_call_args=[{}],
+                tools_call_ids=["call-probe"],
+            )
+        else:
+            yield LLMResponse(role="assistant", completion_text="Final", is_chunk=True)
+            yield LLMResponse(role="assistant", completion_text="Final")
+
+    context = ContextWrapper(context=SimpleNamespace(event=stream.event))
+    context.tool_call_timeout = 0.02 if outcome == "timeout" else 5
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=SimpleNamespace(provider_config={}, text_chat_stream=model, get_model=lambda: "offline"),
+        request=ProviderRequest(
+            prompt="probe",
+            func_tool=ToolSet(
+                tools=[
+                    FunctionTool(
+                        name="probe",
+                        description="probe",
+                        parameters={"type": "object", "properties": {}},
+                        handler=handler,
+                    )
+                ]
+            ),
+        ),
+        run_context=context,
+        tool_executor=FunctionToolExecutor(),
+        agent_hooks=BaseAgentRunHooks(),
+        streaming=True,
+    )
+    from astrbot.core.astr_agent_runtime.execution import execute_native_loop
+
+    class ToolSession(AgentSession):
+        async def execute_turn(self, turn):
+            return await execute_native_loop(runner, turn, 4)
+
+        async def history(self):
+            return []
+
+    if outcome == "tts":
+        stream.event.set_extra("action_type", "live")
+    session = ToolSession("tools", stream.event.unified_msg_origin)
+    turn = await session.run_turn(AgentInput(stream.event, AgentPermissions()))
+    stream.event.bind_agent_turn(turn)
+    try:
+        stream.event.set_result(
+            MessageEventResult(
+                result_content_type=ResultContentType.STREAMING_RESULT,
+                async_stream=present_turn(
+                    turn, streaming=True, show_tool_use=outcome != "hidden"
+                ),
+            )
+        )
+        stage = RespondStage()
+        stage.config = {}
+        await stage.process(stream.event)
+    finally:
+        await session.close()
+        stream.event.bind_agent_turn(None)
+    starts = [
+        body for method, body in requests if body.get("task_display_mode") == "plan"
+    ]
+    assert len(starts) == int(enabled)
+    if enabled:
+        updates = [
+            chunk
+            for _, body in requests
+            for chunk in body.get("chunks", [])
+            if chunk["type"] == "task_update"
+        ]
+        assert [chunk["status"] for chunk in updates] == [
+            "in_progress",
+            "complete" if outcome == "success" else "error",
+        ]
+        assert len({chunk["id"] for chunk in updates}) == 1
+    assert any(body.get("markdown_text") == "Final" for _, body in requests)
+    if outcome in {"success", "off", "hidden", "tts"}:
+        media = next(i for i, (_, body) in enumerate(requests) if "blocks" in body)
+        final = next(
+            i
+            for i, (_, body) in enumerate(requests)
+            if body.get("markdown_text") == "Final"
+        )
+        assert media < final
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize(
+    "failure", ["rejected", "start_lost", "append_lost", "stop_lost", "rate_limit"]
+)
+async def test_task_card_failure_does_not_suppress_answer(stream, monkeypatch, failure):
+    stream.event.native_task_cards = True
+    requests = []
+    failed = False
+    monkeypatch.setattr(
+        "astrbot.core.platform.sources.slack.slack_stream.asyncio.sleep", AsyncMock()
+    )
+
+    async def api(method, **kwargs):
+        nonlocal failed
+        body = kwargs["json"]
+        requests.append((method, body))
+        targeted = (
+            (
+                body.get("task_display_mode")
+                and failure in {"rejected", "start_lost", "rate_limit"}
+            )
+            or (
+                "chunks" in body
+                and method == "chat.appendStream"
+                and failure == "append_lost"
+            )
+            or (
+                method == "chat.stopStream"
+                and body["ts"] == "1"
+                and failure == "stop_lost"
+            )
+        )
+        if targeted and not failed:
+            failed = True
+            if failure in {"rejected", "rate_limit"}:
+                raise SlackApiError(
+                    "controlled failure",
+                    {
+                        "error": "invalid_arguments"
+                        if failure == "rejected"
+                        else "ratelimited"
+                    },
+                )
+            raise TimeoutError("accepted but response lost")
+        return {"ok": True, "ts": body.get("ts", str(len(requests)))}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        yield MessageChain(
+            [Json(data={"id": "tool-1", "name": "probe"})], type="tool_call"
+        )
+        yield MessageChain(
+            [Json(data={"id": "tool-1", "is_error": False})], type="tool_call_result"
+        )
+        yield MessageChain([Plain("Final")])
+
+    await stream.event.send_streaming(chunks())
+    starts = [body for _, body in requests if body.get("task_display_mode")]
+    assert len(starts) == (2 if failure == "rate_limit" else 1)
+    assert any(body.get("markdown_text") == "Final" for _, body in requests)
+    if failure == "start_lost":
+        assert not any(
+            body.get("markdown_text", "").startswith("调用工具") for _, body in requests
+        )
+    if failure == "rejected":
+        assert any(
+            body.get("markdown_text") == "调用工具: probe" for _, body in requests
+        )
+    if failure == "append_lost":
+        updates = [
+            chunk
+            for _, body in requests
+            for chunk in body.get("chunks", [])
+            if chunk["type"] == "task_update"
+        ]
+        assert [chunk["status"] for chunk in updates] == [
+            "in_progress",
+            "complete",
+            "error",
+        ]
+        assert updates[-1]["title"].endswith("（状态未确认）")
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
+async def test_cancelled_task_card_is_not_marked_complete(stream):
+    stream.event.native_task_cards = True
+
+    async def chunks():
+        yield MessageChain(
+            [Json(data={"id": "tool-1", "name": "probe"})], type="tool_call"
+        )
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await stream.event.send_streaming(chunks())
+    updates = [
+        chunk
+        for call in stream.api.await_args_list
+        for chunk in call.kwargs["json"].get("chunks", [])
+        if chunk["type"] == "task_update"
+    ]
+    assert [chunk["status"] for chunk in updates] == ["in_progress", "error"]
+    assert stream.api.await_args_list[-1].args[0] == "chat.stopStream"
+    assert stream.event._stream is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_task_cards_require_opt_in_and_existing_thread(stream, enabled):
+    from astrbot.core.platform.sources.slack.slack_adapter import SlackAdapter
+
+    adapter = SlackAdapter(
+        {
+            "id": "slack",
+            "bot_token": "test",
+            "app_token": "test",
+            "slack_native_task_cards": enabled,
+        },
+        {},
+        asyncio.Queue(),
+    )
+    stream.event.message_obj.message_str = "probe"
+    stream.event.message_obj.session_id = "C123"
+    event = adapter.create_event(stream.event.message_obj)
+    assert event.native_task_cards is (enabled and stream.native)

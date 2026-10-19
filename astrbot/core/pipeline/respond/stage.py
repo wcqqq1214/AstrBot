@@ -280,6 +280,7 @@ class RespondStage(Stage):
                             "reasoning",
                             "audio_chunk",
                             "tool_call",
+                            "tool_call_result",
                             "agent_stats",
                         }:
                             fragment = event._outline_chain(chain.chain)
