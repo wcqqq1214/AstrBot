@@ -1,4 +1,6 @@
+from copy import deepcopy
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,8 +16,10 @@ from astrbot.api.platform import (
     Platform,
     PlatformMetadata,
 )
+from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.pipeline.respond.stage import RespondStage
+from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.platform.sources.slack.slack_adapter import SlackAdapter
 from astrbot.core.platform.sources.slack.slack_event import SlackMessageEvent
@@ -82,22 +86,26 @@ def slack_sender(request, slack_event, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("quoted", [False, True], ids=["plain", "quoted"])
 @pytest.mark.parametrize(
-    "content",
-    [
-        "- **First**\n- [Second](https://example.com)\n\nFollowing paragraph.",
-        "- Parent\n  - Child\n    - `Grandchild`\n- Next\n\nFollowing paragraph.",
-        "1. First\n2. Second\n   1. Child\n3. Third\n\nFollowing paragraph.",
-    ],
-    ids=["unordered", "nested", "ordered"],
+    ("quoted", "mentioned"),
+    [(False, False), (True, False), (True, True)],
+    ids=["plain", "quoted", "quoted-mention"],
 )
 async def test_slack_reply_preserves_markdown(
-    slack_event, slack_sender, content, quoted
+    slack_event, slack_sender, quoted, mentioned
 ):
+    content = (
+        "- **First**\n  - Child\n    - `Grandchild`\n"
+        "- [Second](https://example.com)\n\nFollowing paragraph.\n\n"
+        "1. First\n2. Second\n   1. Child\n3. Third\n\nFinal paragraph."
+    )
     # Split inside the list to verify that message fragments are reassembled.
     split = content.index("\n") + 1
     chain = [Plain(content[:split]), Plain(content[split:])]
+    if mentioned:
+        chain[0].text = "\n" + chain[0].text
+        chain.insert(0, At(qq="U456"))
+        content = "<@U456>\n" + content
     if quoted:
         chain.insert(0, Reply(id="1.0"))
     await slack_sender(MessageChain(chain))
@@ -108,10 +116,14 @@ async def test_slack_reply_preserves_markdown(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mentioned", [False, True])
 @pytest.mark.parametrize("length", [12_000, 12_001])
-async def test_slack_markdown_length_limit(slack_event, length):
-    content = "a" * length
-    await slack_event.send(MessageChain([Plain(content)]))
+async def test_slack_markdown_length_limit(slack_event, length, mentioned):
+    prefix = "<@U456>" if mentioned else ""
+    text = "a" * (length - len(prefix))
+    chain = [At(qq="U456"), Plain(text)] if mentioned else [Plain(text)]
+    await slack_event.send(MessageChain(chain))
+    content = prefix + text
 
     payload = slack_event.web_client.api_call.await_args.kwargs["json"]
     if length == 12_000:
@@ -138,28 +150,30 @@ async def test_slack_empty_text_is_not_sent(slack_event, content, quoted):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("decorated", [False, True])
 async def test_slack_mixed_image_reply_preserves_markdown_order(
-    slack_event, slack_sender, quoted
+    slack_event, slack_sender, decorated
 ):
     chain = [
         Plain("- Before\n  - Nested"),
         Image.fromURL("https://example.com/image.png"),
         Plain("After."),
     ]
-    if quoted:
-        chain.insert(0, Reply(id="1.0"))
+    prefix = "<@U456>\n" if decorated else ""
+    if decorated:
+        chain[0].text = "\n" + chain[0].text
+        chain[:0] = [Reply(id="1.0"), At(qq="U456")]
     await slack_sender(MessageChain(chain))
 
     slack_event.web_client.api_call.assert_awaited_once_with(
         "chat.postMessage",
         json={
             "channel": "C123",
-            "text": "- Before\n  - Nested\n\n[图片]\n\nAfter.",
+            "text": prefix + "- Before\n  - Nested\n\n[图片]\n\nAfter.",
             "blocks": [
                 {
                     "type": "markdown",
-                    "text": "- Before\n  - Nested",
+                    "text": prefix + "- Before\n  - Nested",
                 },
                 {
                     "type": "image",
@@ -173,14 +187,24 @@ async def test_slack_mixed_image_reply_preserves_markdown_order(
 
 
 @pytest.mark.asyncio
-async def test_slack_mention_keeps_existing_format(slack_event):
-    await slack_event.send(MessageChain([At(qq="U456"), Plain(" hello")]))
+async def test_slack_mentions_preserve_component_order(slack_event):
+    await slack_event.send(
+        MessageChain(
+            [
+                Plain("Hello "),
+                At(qq="U456"),
+                Plain(" and "),
+                At(qq="U789"),
+                Plain(".\n\n- First\n  - Child"),
+            ]
+        )
+    )
 
     payload = slack_event.web_client.api_call.await_args.kwargs["json"]
-    assert "markdown_text" not in payload
-    assert payload["blocks"] == [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "<@U456> hello"}}
-    ]
+    assert payload == {
+        "channel": "C123",
+        "markdown_text": "Hello <@U456> and <@U789>.\n\n- First\n  - Child",
+    }
 
 
 @pytest.mark.asyncio
@@ -224,7 +248,8 @@ async def test_slack_mixed_markdown_rejection_reuses_uploaded_image(
     await slack_event.send(
         MessageChain(
             [
-                Plain("- Before\n  - Child"),
+                At(qq="U456"),
+                Plain("\n- Before\n  - Child"),
                 Image.fromFileSystem(str(path)),
                 Plain("After."),
             ]
@@ -245,7 +270,7 @@ async def test_slack_mixed_markdown_rejection_reuses_uploaded_image(
         "blocks": [
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "- Before\n  - Child"},
+                "text": {"type": "mrkdwn", "text": "<@U456>\n- Before\n  - Child"},
             },
             native["blocks"][1],
             {"type": "section", "text": {"type": "mrkdwn", "text": "After."}},
@@ -306,17 +331,79 @@ async def test_slack_mixed_markdown_limit_is_cumulative(slack_event, length):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_mention", [False, True])
-async def test_slack_image_only_and_mention_keep_legacy_blocks(
+async def test_slack_image_only_uses_markdown_only_with_mention(
     slack_event, with_mention
 ):
     chain = [Image.fromURL("https://example.com/image.png")]
     if with_mention:
-        chain[:0] = [At(qq="U456"), Plain("- First")]
+        chain.insert(0, At(qq="U456"))
     await slack_event.send(MessageChain(chain))
 
     slack_event.web_client.api_call.assert_awaited_once()
     payload = slack_event.web_client.api_call.await_args.kwargs["json"]
     assert "markdown_text" not in payload
     assert [block["type"] for block in payload["blocks"]] == (
-        ["section", "image"] if with_mention else ["image"]
+        ["markdown", "image"] if with_mention else ["image"]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_image", [False, True])
+async def test_slack_automatic_mention_through_response_pipeline(
+    slack_event, monkeypatch, with_image
+):
+    config = deepcopy(DEFAULT_CONFIG)
+    config["platform_settings"]["reply_with_mention"] = True
+    config["platform_settings"]["reply_with_quote"] = True
+    config["platform_settings"]["reply_prefix"] = ""
+    config["platform_settings"]["segmented_reply"]["enable"] = False
+    config["t2i"] = False
+    config["provider_tts_settings"]["enable"] = False
+    config["content_safety"]["also_use_in_response"] = False
+    context = SimpleNamespace(
+        astrbot_config=config,
+        plugin_manager=SimpleNamespace(
+            context=SimpleNamespace(
+                get_using_tts_provider_async=AsyncMock(return_value=None),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "astrbot.core.pipeline.result_decorate.stage.star_handlers_registry.get_handlers_by_event_type",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "astrbot.core.pipeline.respond.stage.call_event_hook",
+        AsyncMock(return_value=False),
+    )
+    content = "- First\n  - Child\n\nFollowing paragraph."
+    chain = [Plain(content)]
+    if with_image:
+        chain.extend([Image.fromURL("https://example.com/image.png"), Plain("After.")])
+    slack_event.message_obj.message_id = "1.0"
+    slack_event.set_result(MessageEventResult(chain=chain))
+    decorate = ResultDecorateStage()
+    await decorate.initialize(context)
+    async for _ in decorate.process(slack_event):
+        pass
+    result = slack_event.get_result()
+    assert any(isinstance(segment, At) for segment in result.chain)
+    assert any(isinstance(segment, Reply) for segment in result.chain)
+    respond = RespondStage()
+    respond.platform_settings = {}
+    respond.enable_seg = False
+    await respond.process(slack_event)
+
+    slack_event.web_client.api_call.assert_awaited_once()
+    payload = slack_event.web_client.api_call.await_args.kwargs["json"]
+    expected = "<@U123>\n" + content
+    if with_image:
+        assert [block["type"] for block in payload["blocks"]] == [
+            "markdown",
+            "image",
+            "markdown",
+        ]
+        assert payload["blocks"][0]["text"] == expected
+        assert payload["blocks"][2]["text"] == "After."
+    else:
+        assert payload == {"channel": "C123", "markdown_text": expected}

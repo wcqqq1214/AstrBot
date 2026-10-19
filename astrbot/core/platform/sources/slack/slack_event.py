@@ -258,10 +258,12 @@ class SlackMessageEvent(AstrMessageEvent):
             channel_id: Destination channel or user ID.
             plain_texts: Text also delivered separately by the response pipeline.
         """
-        # Reply metadata does not change the content type of a text-only message.
-        if all(isinstance(segment, (Plain, Reply)) for segment in message.chain):
+        # Native Markdown supports user mentions; Reply is only metadata.
+        if all(isinstance(segment, (Plain, Reply, At)) for segment in message.chain):
             content = "".join(
-                segment.text for segment in message.chain if isinstance(segment, Plain)
+                segment.text if isinstance(segment, Plain) else f"<@{segment.qq}>"
+                for segment in message.chain
+                if isinstance(segment, (Plain, At))
             )
             if not content.strip():
                 return
@@ -301,7 +303,8 @@ class SlackMessageEvent(AstrMessageEvent):
 
             # Reuse uploaded images if Slack rejects native Markdown blocks.
             if any(block["type"] == "image" for block in blocks) and all(
-                isinstance(segment, (Plain, Reply, Image)) for segment in chain.chain
+                isinstance(segment, (Plain, Reply, At, Image))
+                for segment in chain.chain
             ):
                 markdown_length = sum(
                     len(block["text"]["text"])
