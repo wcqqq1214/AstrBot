@@ -418,6 +418,12 @@ class SlackMessageEvent(AstrMessageEvent):
                         if any(p in buffer for p in "。？！~…"):
                             buffer = await self.process_buffer(buffer, pattern)
                     else:
+                        if isinstance(comp, Image):
+                            # Deliver pending text before the image boundary.
+                            if buffer.strip():
+                                await self.send(MessageChain([Plain(buffer)]))
+                                await asyncio.sleep(1.5)
+                            buffer = ""
                         await self.send(MessageChain(chain=[comp]))
                         await asyncio.sleep(1.5)  # 限速
 
