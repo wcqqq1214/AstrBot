@@ -19,7 +19,6 @@ from astrbot.api.platform import (
 from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.message.message_event_result import (
     MessageEventResult,
-    ResultContentType,
 )
 from astrbot.core.pipeline.respond.stage import RespondStage
 from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
@@ -50,7 +49,7 @@ def slack_event(monkeypatch):
     )
 
 
-@pytest.fixture(params=["event", "respond", "session", "buffered_stream"])
+@pytest.fixture(params=["event", "respond", "session"])
 def slack_sender(request, slack_event, monkeypatch):
     if request.param == "event":
         return slack_event.send
@@ -77,15 +76,6 @@ def slack_sender(request, slack_event, monkeypatch):
             await stage.process(slack_event)
 
         return respond
-
-    async def stream(chain):
-        async def fragments():
-            for component in chain.chain:
-                yield MessageChain([component])
-
-        await slack_event.send_streaming(fragments(), use_fallback=False)
-
-    return stream
 
 
 @pytest.mark.asyncio
@@ -410,57 +400,3 @@ async def test_slack_automatic_mention_through_response_pipeline(
         assert payload["blocks"][2]["text"] == "After."
     else:
         assert payload == {"channel": "C123", "markdown_text": expected}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("before", "expected_before"),
-    [
-        ("图片前的说明", ["图片前的说明"]),
-        ("先发一句。剩余说明", ["先发一句。", "剩余说明"]),
-        (" \n", []),
-    ],
-    ids=["pending-text", "sentence-and-remainder", "whitespace"],
-)
-async def test_slack_realtime_stream_preserves_image_order(
-    slack_event, monkeypatch, before, expected_before
-):
-    monkeypatch.setattr("asyncio.sleep", AsyncMock())
-    monkeypatch.setattr(
-        "astrbot.core.pipeline.respond.stage.call_event_hook",
-        AsyncMock(return_value=False),
-    )
-    urls = ["https://example.com/first.png", "https://example.com/second.png"]
-
-    async def chunks():
-        yield MessageChain([Plain(before[:2])])
-        yield MessageChain([Plain(before[2:]), Image.fromURL(urls[0])])
-        yield MessageChain([Image.fromURL(urls[1]), Plain("图片后的说明")])
-
-    slack_event.set_result(
-        MessageEventResult(
-            result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=chunks(),
-        )
-    )
-    stage = RespondStage()
-    stage.config = {
-        "provider_settings": {"unsupported_streaming_strategy": "realtime_segmenting"}
-    }
-    await stage.process(slack_event)
-
-    payloads = [
-        call.kwargs["json"] for call in slack_event.web_client.api_call.await_args_list
-    ]
-    assert payloads == [
-        *({"channel": "C123", "markdown_text": text} for text in expected_before),
-        *(
-            {
-                "channel": "C123",
-                "text": "",
-                "blocks": [{"type": "image", "image_url": url, "alt_text": "图片"}],
-            }
-            for url in urls
-        ),
-        {"channel": "C123", "markdown_text": "图片后的说明"},
-    ]

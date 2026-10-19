@@ -1,5 +1,4 @@
 import asyncio
-import re
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import cast
@@ -24,6 +23,8 @@ from astrbot.api.message_components import (
 from astrbot.api.platform import Group, MessageMember
 from astrbot.core.platform.button_interaction import encode_button_callback
 from astrbot.core.utils.media_utils import MediaResolver, file_uri_to_path
+
+from .slack_stream import SlackMessageStream
 
 
 class SlackMessageEvent(AstrMessageEvent):
@@ -160,6 +161,7 @@ class SlackMessageEvent(AstrMessageEvent):
         web_client: AsyncWebClient,
         channel_id: str | None = None,
         plain_texts: set[str] | None = None,
+        thread_ts: str | None = None,
     ):
         """Build Slack blocks and upload audio to the destination conversation.
 
@@ -168,6 +170,7 @@ class SlackMessageEvent(AstrMessageEvent):
             web_client: Slack client used for uploads.
             channel_id: Destination channel or user ID, required for audio uploads.
             plain_texts: Text already included in the reply, possibly sent separately.
+            thread_ts: Existing thread containing the reply, if any.
 
         Returns:
             Blocks and fallback text. Both are empty for audio-only uploads.
@@ -200,6 +203,7 @@ class SlackMessageEvent(AstrMessageEvent):
                         file=await asyncio.to_thread(path.read_bytes),
                         filename=path.name,
                         channel=channel_id,
+                        **({"thread_ts": thread_ts} if thread_ts else {}),
                     )
                     if not response["ok"]:
                         raise RuntimeError(response.get("error", "Audio upload failed"))
@@ -249,6 +253,7 @@ class SlackMessageEvent(AstrMessageEvent):
         web_client: AsyncWebClient,
         channel_id: str,
         plain_texts: set[str] | None = None,
+        thread_ts: str | None = None,
     ) -> None:
         """Send native Markdown text or image messages with a legacy block fallback.
 
@@ -257,7 +262,11 @@ class SlackMessageEvent(AstrMessageEvent):
             web_client: Slack client used to deliver messages.
             channel_id: Destination channel or user ID.
             plain_texts: Text also delivered separately by the response pipeline.
+            thread_ts: Existing thread containing the reply, if any.
         """
+        destination = {"channel": channel_id}
+        if thread_ts:
+            destination["thread_ts"] = thread_ts
         # Native Markdown supports user mentions; Reply is only metadata.
         if all(isinstance(segment, (Plain, Reply, At)) for segment in message.chain):
             content = "".join(
@@ -271,7 +280,7 @@ class SlackMessageEvent(AstrMessageEvent):
             # Keep oversized messages on the existing delivery path.
             if len(content) <= 12_000:
                 await web_client.chat_postMessage(
-                    channel=channel_id,
+                    **destination,
                     markdown_text=content,
                 )
                 return
@@ -297,6 +306,7 @@ class SlackMessageEvent(AstrMessageEvent):
                 web_client,
                 channel_id=channel_id,
                 plain_texts=plain_texts,
+                thread_ts=thread_ts,
             )
             if not blocks and not text.strip():
                 continue
@@ -326,7 +336,7 @@ class SlackMessageEvent(AstrMessageEvent):
                     )
                     try:
                         await web_client.chat_postMessage(
-                            channel=channel_id,
+                            **destination,
                             text=fallback_text,
                             blocks=markdown_blocks,
                         )
@@ -344,7 +354,7 @@ class SlackMessageEvent(AstrMessageEvent):
 
             try:
                 await web_client.chat_postMessage(
-                    channel=channel_id,
+                    **destination,
                     text=text,
                     blocks=blocks or None,
                 )
@@ -370,7 +380,7 @@ class SlackMessageEvent(AstrMessageEvent):
                     ):
                         parts.append(segment.text or "[Audio]")
                 await web_client.chat_postMessage(
-                    channel=channel_id,
+                    **destination,
                     text="".join(parts),
                 )
 
@@ -382,11 +392,16 @@ class SlackMessageEvent(AstrMessageEvent):
             for segment in (result.chain if result else [])
             if isinstance(segment, Plain)
         }
+        raw = getattr(self.message_obj, "raw_message", None)
+        raw = raw if isinstance(raw, dict) else {}
         await self._send_message(
             message,
             self.web_client,
-            channel_id=self.get_group_id() or self.get_sender_id(),
+            channel_id=raw.get("channel")
+            or self.get_group_id()
+            or self.get_sender_id(),
             plain_texts=plain_texts,
+            thread_ts=raw.get("thread_ts"),
         )
         await super().send(message)
 
@@ -395,40 +410,13 @@ class SlackMessageEvent(AstrMessageEvent):
         generator: AsyncGenerator,
         use_fallback: bool = False,
     ):
-        if not use_fallback:
-            buffer = None
-            async for chain in generator:
-                if not buffer:
-                    buffer = chain
-                else:
-                    buffer.chain.extend(chain.chain)
-            if not buffer:
-                return None
-            await self.send(buffer)
-            return await super().send_streaming(generator, use_fallback)
+        """Stream text without breaking Markdown structure at sentence boundaries.
 
-        buffer = ""
-        pattern = re.compile(r"[^。？！~…]+[。？！~…]+")
-
-        async for chain in generator:
-            if isinstance(chain, MessageChain):
-                for comp in chain.chain:
-                    if isinstance(comp, Plain):
-                        buffer += comp.text
-                        if any(p in buffer for p in "。？！~…"):
-                            buffer = await self.process_buffer(buffer, pattern)
-                    else:
-                        if isinstance(comp, Image):
-                            # Deliver pending text before the image boundary.
-                            if buffer.strip():
-                                await self.send(MessageChain([Plain(buffer)]))
-                                await asyncio.sleep(1.5)
-                            buffer = ""
-                        await self.send(MessageChain(chain=[comp]))
-                        await asyncio.sleep(1.5)  # 限速
-
-        if buffer.strip():
-            await self.send(MessageChain([Plain(buffer)]))
+        Args:
+            generator: Ordered response deltas and components.
+            use_fallback: Retained for the shared interface; Slack supports streaming.
+        """
+        await SlackMessageStream(self).run(generator)
         return await super().send_streaming(generator, use_fallback)
 
     async def get_group(self, group_id=None, **kwargs):
