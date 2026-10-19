@@ -95,6 +95,8 @@ in the Slack adapter settings. Also enable streaming replies and tool-use displa
 in the active configuration. For replies inside an existing thread, AstrBot shows
 tool starts and results in one native plan card, separate from the answer. Cards
 show tool names and status, without arguments or result contents.
+Tool names are normalized to a single line and shortened to 120 characters,
+including an ellipsis when truncated, in both native cards and text progress.
 
 Top-level channel messages, non-streaming replies, and live TTS keep their existing
 tool-progress behavior. Disabling tool-use display also hides the cards. Exceptions,
@@ -110,6 +112,12 @@ writes or suppressing the answer. When Slack explicitly reports that a card stre
 is closed, AstrBot attempts to open a new card in the same thread with the current
 task states, once per update. The old card remains visible. If reopening fails,
 the same fallback rules apply.
+
+Text progress shows the eight most recently started tasks. Older tasks are
+summarized by status, including failures and unfinished tasks, while their full
+state remains available for later updates. During cleanup, unfinished tasks are
+shown as unconfirmed. Native cards retain their task history and use Slack's
+collapsible display.
 
 Progress rate limits do not pause tool execution. AstrBot retains the latest task
 states during `Retry-After` and sends them on the next progress event after the

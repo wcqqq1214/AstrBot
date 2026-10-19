@@ -65,10 +65,7 @@ class SlackTaskCards:
                 )
             )
         for task in tasks[-8:]:
-            title = " ".join(task["title"].split())
-            if len(title) > 120:
-                title = title[:117].rstrip() + "..."
-            lines.append(f"• {title}：{statuses[task['status']]}")
+            lines.append(f"• {task['title']}：{statuses[task['status']]}")
         return "\n".join(lines)
 
     async def _request(self, method: str, **kwargs):
@@ -131,10 +128,13 @@ class SlackTaskCards:
             return
         task_id = str(data["id"])
         if chain.type == "tool_call":
+            title = " ".join(str(data.get("name") or "Tool").split()) or "Tool"
+            if len(title) > 120:
+                title = title[:117].rstrip() + "..."
             task = {
                 "type": "task_update",
                 "id": task_id,
-                "title": str(data.get("name") or "Tool")[:256],
+                "title": title,
                 "status": "in_progress",
             }
         elif task_id in self.tasks:
@@ -277,11 +277,13 @@ class SlackTaskCards:
             tasks = dict(self.tasks)
             if not self.disabled and not self.fallback:
                 tasks.update(self.pending)
+            unconfirmed_suffix = "（状态未确认）"
             pending = [
                 {
                     **task,
                     "status": "error",
-                    "title": task["title"][:240] + "（状态未确认）",
+                    "title": task["title"][: 120 - len(unconfirmed_suffix)].rstrip()
+                    + unconfirmed_suffix,
                 }
                 if task["status"] == "in_progress"
                 else task

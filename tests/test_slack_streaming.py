@@ -1671,6 +1671,75 @@ async def test_task_card_text_fallback_edits_one_message_through_respond(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True], indirect=True)
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_task_titles_are_compact_through_respond(stream, fallback):
+    stream.event.native_task_cards = True
+    requests = []
+    names = {
+        "spaced": (" \n lookup\t docs ", "lookup docs"),
+        "boundary": ("x" * 120, "x" * 120),
+        "blank": (" \n\t", "Tool"),
+        "long": ("查" * 121, "查" * 117 + "..."),
+    }
+
+    async def api(method, **kwargs):
+        body = kwargs["json"]
+        requests.append((method, body))
+        if fallback and body.get("task_display_mode"):
+            raise SlackApiError("cards unavailable", {"error": "invalid_arguments"})
+        return {"ok": True, "ts": body.get("ts", "progress")}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        for task_id, (name, _) in names.items():
+            yield MessageChain(
+                [Json(data={"id": task_id, "name": name})], type="tool_call"
+            )
+            if task_id != "long":
+                yield MessageChain(
+                    [Json(data={"id": task_id, "is_error": False})],
+                    type="tool_call_result",
+                )
+        yield MessageChain([], type="aborted")
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    await stage.process(stream.event)
+
+    if fallback:
+        text = requests[-1][1]["text"]
+        assert text.splitlines() == [
+            "AstrBot 工具进度",
+            *[
+                f"• {title}：{'状态未确认' if task_id == 'long' else '已完成'}"
+                for task_id, (_, title) in names.items()
+            ],
+        ]
+    else:
+        for method, body in requests:
+            for task in body.get("chunks", []):
+                if task["type"] != "task_update":
+                    continue
+                assert len(task["title"]) <= 120
+                assert task["title"] == (
+                    "查" * 113 + "（状态未确认）"
+                    if method == "chat.stopStream"
+                    else names[task["id"]][1]
+                )
+        assert requests[-1][0] == "chat.stopStream"
+        assert requests[-1][1]["chunks"][0]["status"] == "error"
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True], indirect=True)
 @pytest.mark.parametrize("ending", ["complete", "aborted", "rate_limited"])
 async def test_long_text_progress_stays_bounded_through_respond(
     stream, monkeypatch, ending
