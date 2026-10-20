@@ -239,16 +239,24 @@ async def test_slack_empty_markdown_reply_through_respond_stage(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_code", [None, "invalid_auth", "service_unavailable"])
-async def test_slack_markdown_other_failures_do_not_resend(slack_event, error_code):
+@pytest.mark.parametrize("shape", ["text", "image", "mixed"])
+async def test_slack_other_failures_do_not_resend(slack_event, error_code, shape):
     error = (
-        SlackApiError("Rejected", {"error": error_code})
+        SlackApiError("Send failed", {"ok": False, "error": error_code})
         if error_code
         else TimeoutError("Response timed out")
     )
     slack_event.web_client.api_call.side_effect = error
+    chain = (
+        [Plain("- First\n- Second")]
+        if shape == "text"
+        else [Image.fromURL("https://example.com/image.png")]
+    )
+    if shape == "mixed":
+        chain.insert(0, Plain("- First"))
 
     with pytest.raises(type(error)):
-        await slack_event.send(MessageChain([Plain("- First\n- Second")]))
+        await slack_event.send(MessageChain(chain))
 
     slack_event.web_client.api_call.assert_awaited_once()
 
@@ -314,28 +322,6 @@ async def test_slack_mixed_markdown_rejection_reuses_uploaded_image(
     }
     assert native["blocks"][1]["slack_file"]["url"] == "https://slack.test/image.png"
     assert path.read_bytes() == b"test image"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error_code", [None, "invalid_auth", "service_unavailable"])
-@pytest.mark.parametrize("with_text", [False, True])
-async def test_slack_image_does_not_retry_other_errors(
-    slack_event, error_code, with_text
-):
-    error = (
-        SlackApiError("Send failed", {"ok": False, "error": error_code})
-        if error_code
-        else TimeoutError("Response timed out")
-    )
-    slack_event.web_client.api_call.side_effect = error
-
-    with pytest.raises(type(error)):
-        chain = [Image.fromURL("https://example.com/image.png")]
-        if with_text:
-            chain.insert(0, Plain("- First"))
-        await slack_event.send(MessageChain(chain))
-
-    slack_event.web_client.api_call.assert_awaited_once()
 
 
 @pytest.mark.asyncio
