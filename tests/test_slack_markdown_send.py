@@ -188,10 +188,66 @@ async def test_slack_mentions_preserve_component_order(slack_event):
 
 
 @pytest.mark.asyncio
-async def test_slack_markdown_timeout_does_not_resend(slack_event):
-    slack_event.web_client.api_call.side_effect = TimeoutError("Response timed out")
+async def test_slack_empty_markdown_falls_back_only_for_rejected_part(
+    slack_event, slack_sender
+):
+    client = slack_event.web_client
+    client.api_call.side_effect = [
+        {"ok": True, "ts": "1.0"},
+        SlackApiError("Empty rendered Markdown", {"error": "no_text"}),
+        {"ok": True, "ts": "2.0"},
+    ]
+    content = "a" * 12_000
 
-    with pytest.raises(TimeoutError):
+    await slack_sender(MessageChain([Plain(content + "#")]))
+
+    assert [call.kwargs["json"] for call in client.api_call.await_args_list] == [
+        {"channel": "C123", "markdown_text": content},
+        {"channel": "C123", "markdown_text": "#"},
+        {"channel": "C123", "text": "#", "mrkdwn": False},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_slack_empty_markdown_reply_through_respond_stage(
+    slack_event, monkeypatch
+):
+    slack_event.message_obj.raw_message = {"channel": "C123", "thread_ts": "0.1"}
+    slack_event.web_client.api_call.side_effect = [
+        SlackApiError("Empty rendered Markdown", {"error": "no_text"}),
+        {"ok": True, "ts": "1.0"},
+    ]
+    slack_event.set_result(MessageEventResult(chain=[Reply(id="0.1"), Plain("#")]))
+    monkeypatch.setattr(
+        "astrbot.core.pipeline.respond.stage.call_event_hook",
+        AsyncMock(return_value=False),
+    )
+    respond = RespondStage()
+    respond.platform_settings = {}
+    respond.enable_seg = False
+
+    await respond.process(slack_event)
+
+    assert [
+        call.kwargs["json"] for call in slack_event.web_client.api_call.await_args_list
+    ] == [
+        {"channel": "C123", "thread_ts": "0.1", "markdown_text": "#"},
+        {"channel": "C123", "thread_ts": "0.1", "text": "#", "mrkdwn": False},
+    ]
+    assert slack_event.get_result() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [None, "invalid_auth", "service_unavailable"])
+async def test_slack_markdown_other_failures_do_not_resend(slack_event, error_code):
+    error = (
+        SlackApiError("Rejected", {"error": error_code})
+        if error_code
+        else TimeoutError("Response timed out")
+    )
+    slack_event.web_client.api_call.side_effect = error
+
+    with pytest.raises(type(error)):
         await slack_event.send(MessageChain([Plain("- First\n- Second")]))
 
     slack_event.web_client.api_call.assert_awaited_once()

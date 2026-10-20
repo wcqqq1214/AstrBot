@@ -290,12 +290,24 @@ class SlackMessageEvent(AstrMessageEvent):
             for part in split_slack_markdown(content):
                 if not part.strip():
                     continue
-                await slack_api_request(
-                    web_client,
-                    "chat_postMessage",
-                    **destination,
-                    markdown_text=part,
-                )
+                try:
+                    await slack_api_request(
+                        web_client,
+                        "chat_postMessage",
+                        **destination,
+                        markdown_text=part,
+                    )
+                except SlackApiError as error:
+                    if error.response.get("error") != "no_text":
+                        raise
+                    # Preserve completed Markdown that Slack renders as empty.
+                    await slack_api_request(
+                        web_client,
+                        "chat_postMessage",
+                        **destination,
+                        text=part,
+                        mrkdwn=False,
+                    )
             return
 
         plain_texts = (plain_texts or set()) | {
