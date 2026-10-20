@@ -180,8 +180,11 @@ class SlackMessageStream:
                         if isinstance(exc, SlackApiError)
                         else None
                     )
-                    if error == "no_text" and not final:
+                    if error == "no_text":
                         self.empty_text = self.text
+                        if final:
+                            # Re-enter once to send only the rejected segment literally.
+                            await self._flush(final=True)
                         return
                     if error not in _STREAM_CAPABILITY_ERRORS and error not in {
                         "not_allowed",
@@ -224,16 +227,29 @@ class SlackMessageStream:
                         self.client, "chat_postMessage", **destination, **body
                     )
                 except SlackApiError as exc:
-                    if exc.response.get("error") != "no_text" or final:
+                    if exc.response.get("error") != "no_text" or literal:
                         raise
-                    # Slack can reject an unfinished heading before content arrives.
+                    # Buffer unfinished headings; seal rejected final segments literally.
                     self.empty_text = self.text
+                    if final:
+                        await self._flush(final=True)
                     return
                 self.ts = response["ts"]
             elif self.sent != self.text or self.open:
-                await slack_api_request(
-                    self.client, "chat_update", channel=self.channel, ts=self.ts, **body
-                )
+                try:
+                    await slack_api_request(
+                        self.client,
+                        "chat_update",
+                        channel=self.channel,
+                        ts=self.ts,
+                        **body,
+                    )
+                except SlackApiError as exc:
+                    if exc.response.get("error") != "no_text" or not final or literal:
+                        raise
+                    self.empty_text = self.text
+                    await self._flush(final=True)
+                    return
             self.sent = self.text
         if final and self.open:
             await slack_api_request(

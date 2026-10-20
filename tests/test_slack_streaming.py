@@ -169,6 +169,101 @@ async def test_empty_markdown_prefix_is_buffered_through_respond_stage(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("boundary_error", ["no_text", "invalid_auth", "timeout"])
+@pytest.mark.parametrize("already_visible", [False, True])
+async def test_empty_markdown_at_size_boundary_through_respond_stage(
+    stream, boundary_error, already_visible
+):
+    messages = {}
+    attempts = []
+    content = "a" * 12_000
+
+    async def api(method, **kwargs):
+        body = kwargs["json"]
+        attempts.append((method, body))
+        text = body.get("markdown_text", body.get("text"))
+        if text == "#" or body.get("markdown_text") == "#\n\n":
+            if text != "#" and boundary_error == "timeout":
+                raise TimeoutError("Unknown delivery outcome")
+            error = "no_text" if text == "#" else boundary_error
+            raise SlackApiError("Rejected", {"error": error})
+        ts = body.get("ts", str(len(messages) + 1))
+        if method in {"chat.postMessage", "chat.startStream", "chat.update"}:
+            messages[ts] = text
+        elif method == "chat.appendStream":
+            messages[ts] += text
+        return {"ok": True, "ts": ts}
+
+    stream.api.side_effect = api
+
+    async def chunks():
+        yield MessageChain([Plain("Before")])
+        yield MessageChain([], type="break")
+        yield MessageChain([Plain("#")])
+        if already_visible:
+            yield MessageChain([Plain("\n\na")])
+            yield MessageChain([Plain(content[1:])])
+        else:
+            yield MessageChain([Plain("\n\n" + content)])
+
+    stream.event.set_result(
+        MessageEventResult(
+            result_content_type=ResultContentType.STREAMING_RESULT,
+            async_stream=chunks(),
+        )
+    )
+    stage = RespondStage()
+    stage.config = {}
+    if boundary_error == "no_text":
+        await stage.process(stream.event)
+        assert list(messages.values()) == ["Before", "#\n\n", content]
+        literal = [(method, body) for method, body in attempts if "text" in body]
+        target = (
+            {"ts": "2"}
+            if already_visible
+            else ({"thread_ts": "0.1"} if stream.native else {})
+        )
+        assert literal == [
+            (
+                "chat.update" if already_visible else "chat.postMessage",
+                {"channel": "C123", **target, "text": "#\n\n", "mrkdwn": False},
+            )
+        ]
+        assert next(
+            method for method, body in attempts if body.get("markdown_text") == content
+        ) == (
+            "chat.startStream"
+            if stream.native and not already_visible
+            else "chat.postMessage"
+        )
+    else:
+        with pytest.raises(
+            TimeoutError if boundary_error == "timeout" else SlackApiError
+        ):
+            await stage.process(stream.event)
+        assert list(messages.values()) == [
+            "Before",
+            *(["#\n\na"] if already_visible else []),
+        ]
+        assert not any("text" in body for _, body in attempts)
+    expected = 2 if boundary_error == "no_text" else 1
+    assert (
+        sum(
+            body.get("markdown_text", body.get("text")) == "#\n\n"
+            for _, body in attempts
+        )
+        == expected
+    )
+    assert all(
+        body["channel"] == "C123"
+        and body.get("thread_ts") == ("0.1" if stream.native else None)
+        for method, body in attempts
+        if method in {"chat.postMessage", "chat.startStream"}
+    )
+    assert stream.event._stream is None
+
+
+@pytest.mark.asyncio
 async def test_media_and_tool_boundaries_close_before_next_send(stream):
     async def chunks():
         yield MessageChain([Plain("图片前。\n  - 子项")])
