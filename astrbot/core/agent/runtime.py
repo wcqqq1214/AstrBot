@@ -201,6 +201,11 @@ class AgentTurn:
         )
         self._changed.set()
 
+    @property
+    def event_count(self) -> int:
+        """Number of published events, for ordered delivery barriers."""
+        return len(self._events)
+
     async def events(self) -> AsyncIterator[RuntimeEvent]:
         """Read this turn's ordered events, including already published events.
 

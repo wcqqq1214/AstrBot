@@ -709,23 +709,27 @@ class Context:
         for platform in self.platform_manager.platform_insts:
             if platform.meta().id == session.platform_name:
                 event = current_message_event.get()
-                reply_in_thread = (
+                reply_via_event = (
                     platform.meta().name == "slack"
                     and event is not None
                     and event._execution_active
                     and event.get_platform_name() == "slack"
                     and event.unified_msg_origin == str(session)
                     and isinstance(event.message_obj.raw_message, dict)
-                    and bool(event.message_obj.raw_message.get("thread_ts"))
+                    and (
+                        bool(event.message_obj.raw_message.get("thread_ts"))
+                        or getattr(event, "_stream", None) is not None
+                        or getattr(event, "_agent_turn", None) is not None
+                    )
                 )
-                if reply_in_thread:
-                    # Session IDs omit Slack threads. Reuse the active reply path
-                    # to retain the thread and flush pending text before media.
+                if reply_via_event:
+                    # Reuse the current event to retain Slack threads and seal
+                    # pending streamed text before tool output.
                     await event.send(message_chain)
                 else:
                     await platform.send_by_session(session, message_chain)
                 if (
-                    not reply_in_thread
+                    not reply_via_event
                     and event is not None
                     and event._execution_active
                     and message_chain.chain

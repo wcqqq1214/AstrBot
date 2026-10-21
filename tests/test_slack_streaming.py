@@ -22,8 +22,10 @@ from astrbot.api.platform import (
     MessageType,
     PlatformMetadata,
 )
-from astrbot.core.agent.response import AgentResponse
-from astrbot.core.astr_agent_run_util import run_agent
+from astrbot.core.agent.events import MessageCompleted, TextDelta, TurnResult
+from astrbot.core.agent.runtime import AgentInput, AgentPermissions, AgentSession
+from astrbot.core.agent_output import present_turn
+from astrbot.core.agent_output_content import content_from_chain
 from astrbot.core.message.message_event_result import (
     MessageEventResult,
     ResultContentType,
@@ -727,12 +729,11 @@ async def test_sdk_disconnect_does_not_replay_delivered_text(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "direct_send", [False, True], ids=["yield-result", "event-send"]
-)
+@pytest.mark.parametrize("delivery", ["yield-result", "event-send", "model-image"])
 async def test_tool_direct_image_through_agent_and_respond_preserves_order(
-    stream, direct_send
+    stream, delivery
 ):
+    direct_send = delivery == "event-send"
     messages = []
     closed = set()
 
@@ -762,47 +763,50 @@ async def test_tool_direct_image_through_agent_and_respond_preserves_order(
 
     stream.api.side_effect = api
 
-    class Runner:
-        streaming = True
-        req = None
-        run_context = SimpleNamespace(context=SimpleNamespace(event=stream.event))
-
-        def done(self):
-            return True
-
-        async def step(self):
-            for kind, chain in [
-                ("streaming_delta", MessageChain([Plain("- 准备。\n")])),
-                ("streaming_delta", MessageChain([Plain("  - 子项。")])),
-                ("tool_call", MessageChain([], type="tool_call")),
-                (
-                    "tool_call_result",
-                    MessageChain(
-                        [Image.fromURL("https://example.com/image.png")],
-                        type="tool_direct_result",
-                    ),
-                ),
-                ("streaming_delta", MessageChain([Plain("完成。")])),
-            ]:
-                if direct_send and kind == "tool_call_result":
-                    # Real plugins may send inside the tool instead of yielding a result.
-                    chain.type = None
+    class ImageSession(AgentSession):
+        async def execute_turn(self, turn):
+            turn.emit(TextDelta(message_id="before", part_index=0, text="- 准备。\n"))
+            turn.emit(TextDelta(message_id="before", part_index=0, text="  - 子项。"))
+            chain = MessageChain(
+                [Image.fromURL("https://example.com/image.png")],
+                type=None if direct_send else "tool_direct_result",
+            )
+            if delivery == "model-image":
+                turn.emit(
+                    MessageCompleted(
+                        message_id="image", content=content_from_chain(chain)
+                    )
+                )
+            else:
+                # The new tool executor sends yielded results through event.send too.
+                await stream.event.send(chain)
+                if direct_send:
                     await stream.event.send(chain)
-                    await stream.event.send(chain)
-                else:
-                    yield AgentResponse(type=kind, data={"chain": chain})
+            turn.emit(TextDelta(message_id="after", part_index=0, text="完成。"))
+            return TurnResult()
 
+        async def history(self):
+            return []
+
+    session = ImageSession("images", stream.event.unified_msg_origin)
+    turn = await session.run_turn(AgentInput(stream.event, AgentPermissions()))
+    stream.event.bind_agent_turn(turn)
     stream.event.set_result(
         MessageEventResult(
             result_content_type=ResultContentType.STREAMING_RESULT,
-            async_stream=run_agent(Runner(), show_tool_use=False),
+            async_stream=present_turn(turn, streaming=True, show_tool_use=False),
         )
     )
     stage = RespondStage()
     stage.config = {
         "provider_settings": {"unsupported_streaming_strategy": "realtime_segmenting"}
     }
-    await stage.process(stream.event)
+    try:
+        await asyncio.wait_for(stage.process(stream.event), timeout=3)
+    finally:
+        await session.close()
+        stream.event.bind_agent_turn(None)
+    assert (await turn.result()).status == "completed"
     assert messages == [
         "- 准备。\n  - 子项。",
         *(["[image]"] * (2 if direct_send else 1)),

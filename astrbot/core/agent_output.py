@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from typing import TYPE_CHECKING
 
 from astrbot.core.agent.events import (
@@ -125,193 +126,205 @@ async def present_turn(
     emitted: set[str] = set()
     emitted_reasoning: set[str] = set()
     completed: set[str] = set()
-    async for output in turn.events():
-        payload = output.payload
-        if isinstance(payload, TurnFinished):
-            if buffered.chain:
-                yield buffered
-            result = payload.result
-            if (
-                result.status == TurnStatus.COMPLETED
-                and result.content
-                and not completed
-                and not emitted
-            ):
-                chain = chain_from_content(
-                    tuple(
-                        part
-                        for part in result.content
-                        if not isinstance(part, ReasoningOutput)
-                    )
-                )
-                if chain.chain:
-                    yield chain
-            if (
-                result.status == TurnStatus.CANCELLED
-                and result.error is None
-                and not turn.cancellation_requested
-            ):
-                event.set_extra("agent_user_aborted", True)
-            if result.status == TurnStatus.FAILED:
-                text = extract_persona_custom_error_message_from_event(event) or (
-                    f"LLM 响应错误: {result.error.message or '未知错误'}"
-                    if result.error and result.error.code == "provider_error"
-                    else f"Error occurred during AI execution.\n{result.error.message if result.error else 'Unknown error'}"
-                )
-                yield MessageChain().message(text)
-            return
-        if isinstance(payload, TurnPrepared):
-            event.set_extra("_agent_chat_model", payload.model)
-            if (
-                context is not None
-                and event.get_platform_name() == "webchat"
-                and not isinstance(event, AgentWakeupEvent)
-                and payload.provider_id
-            ):
-                from astrbot.core.pipeline.process_stage.method.agent_sub_stages.webchat import (
-                    generate_conversation_title,
-                )
-
-                provider = context.get_provider_by_id(payload.provider_id)
-                if isinstance(provider, Provider):
-                    asyncio.create_task(
-                        generate_conversation_title(
-                            event, payload.user_prompt, provider
+    iterator = getattr(type(event), "iter_agent_output", None)
+    outputs = iterator(event, turn) if iterator is not None else turn.events()
+    async with aclosing(outputs):
+        async for output in outputs:
+            payload = output.payload
+            if isinstance(payload, TurnFinished):
+                if buffered.chain:
+                    yield buffered
+                result = payload.result
+                if (
+                    result.status == TurnStatus.COMPLETED
+                    and result.content
+                    and not completed
+                    and not emitted
+                ):
+                    chain = chain_from_content(
+                        tuple(
+                            part
+                            for part in result.content
+                            if not isinstance(part, ReasoningOutput)
                         )
                     )
-        elif isinstance(payload, (TextDelta, ReasoningDelta)):
-            if (
-                streaming
-                and not stream_to_general
-                and (not isinstance(payload, ReasoningDelta) or show_reasoning)
-            ):
-                (
-                    emitted_reasoning
-                    if isinstance(payload, ReasoningDelta)
-                    else emitted
-                ).add(payload.message_id)
-                yield MessageChain(
-                    type="reasoning" if isinstance(payload, ReasoningDelta) else None
-                ).message(payload.text)
-        elif isinstance(payload, MessageCompleted):
-            if payload.message_id in completed:
-                continue
-            completed.add(payload.message_id)
-            if (
-                streaming
-                and not stream_to_general
-                and show_reasoning
-                and payload.message_id not in emitted_reasoning
-            ):
-                reasoning = "".join(
-                    part.text or ""
-                    for part in payload.content
-                    if isinstance(part, ReasoningOutput)
-                )
-                if reasoning:
-                    yield MessageChain(type="reasoning").message(reasoning)
-            content = tuple(
-                part
-                for part in payload.content
-                if not isinstance(part, ReasoningOutput)
-            )
-            if streaming and not stream_to_general and payload.message_id in emitted:
-                # Text deltas are already visible; complete snapshots must not repeat them.
-                content = tuple(
-                    part for part in content if not isinstance(part, PlainOutput)
-                )
-            chain = chain_from_content(content)
-            if chain.chain:
-                if buffer:
-                    buffered.chain.extend(chain.chain)
-                else:
-                    yield chain
-        elif isinstance(payload, ToolStarted):
-            names[payload.execution_id] = (payload.name, payload.call_id)
-            info = {
-                "id": payload.call_id,
-                "name": payload.name,
-                "args": payload.arguments,
-                "ts": output.created_at.timestamp(),
-            }
-            event.trace.record("agent_tool_call", tool_name=info)
-            if streaming and show_tool_use:
-                yield MessageChain(chain=[], type="break")
-            if event.get_platform_name() == "webchat":
-                await event.send(
-                    MessageChain(type="tool_call", chain=[Json(data=info)])
-                )
-            elif show_tool_use and not show_tool_call_result:
-                await event.send(
-                    MessageChain(type="tool_call").message(
-                        f"🔨 调用工具: {payload.name}"
+                    if chain.chain:
+                        yield chain
+                if (
+                    result.status == TurnStatus.CANCELLED
+                    and result.error is None
+                    and not turn.cancellation_requested
+                ):
+                    event.set_extra("agent_user_aborted", True)
+                if result.status == TurnStatus.FAILED:
+                    text = extract_persona_custom_error_message_from_event(event) or (
+                        f"LLM 响应错误: {result.error.message or '未知错误'}"
+                        if result.error and result.error.code == "provider_error"
+                        else f"Error occurred during AI execution.\n{result.error.message if result.error else 'Unknown error'}"
                     )
+                    yield MessageChain().message(text)
+                return
+            if isinstance(payload, TurnPrepared):
+                event.set_extra("_agent_chat_model", payload.model)
+                if (
+                    context is not None
+                    and event.get_platform_name() == "webchat"
+                    and not isinstance(event, AgentWakeupEvent)
+                    and payload.provider_id
+                ):
+                    from astrbot.core.pipeline.process_stage.method.agent_sub_stages.webchat import (
+                        generate_conversation_title,
+                    )
+
+                    provider = context.get_provider_by_id(payload.provider_id)
+                    if isinstance(provider, Provider):
+                        asyncio.create_task(
+                            generate_conversation_title(
+                                event, payload.user_prompt, provider
+                            )
+                        )
+            elif isinstance(payload, (TextDelta, ReasoningDelta)):
+                if (
+                    streaming
+                    and not stream_to_general
+                    and (not isinstance(payload, ReasoningDelta) or show_reasoning)
+                ):
+                    (
+                        emitted_reasoning
+                        if isinstance(payload, ReasoningDelta)
+                        else emitted
+                    ).add(payload.message_id)
+                    yield MessageChain(
+                        type="reasoning"
+                        if isinstance(payload, ReasoningDelta)
+                        else None
+                    ).message(payload.text)
+            elif isinstance(payload, MessageCompleted):
+                if payload.message_id in completed:
+                    continue
+                completed.add(payload.message_id)
+                if (
+                    streaming
+                    and not stream_to_general
+                    and show_reasoning
+                    and payload.message_id not in emitted_reasoning
+                ):
+                    reasoning = "".join(
+                        part.text or ""
+                        for part in payload.content
+                        if isinstance(part, ReasoningOutput)
+                    )
+                    if reasoning:
+                        yield MessageChain(type="reasoning").message(reasoning)
+                content = tuple(
+                    part
+                    for part in payload.content
+                    if not isinstance(part, ReasoningOutput)
                 )
-        elif isinstance(payload, (ToolFinished, ToolRejected)):
-            if isinstance(payload, ToolFinished):
-                name, call_id = names.pop(
-                    payload.execution_id, ("unknown", payload.call_id)
+                if (
+                    streaming
+                    and not stream_to_general
+                    and payload.message_id in emitted
+                ):
+                    # Text deltas are already visible; complete snapshots must not repeat them.
+                    content = tuple(
+                        part for part in content if not isinstance(part, PlainOutput)
+                    )
+                chain = chain_from_content(content)
+                if chain.chain:
+                    if buffer:
+                        buffered.chain.extend(chain.chain)
+                    else:
+                        yield chain
+            elif isinstance(payload, ToolStarted):
+                names[payload.execution_id] = (payload.name, payload.call_id)
+                info = {
+                    "id": payload.call_id,
+                    "name": payload.name,
+                    "args": payload.arguments,
+                    "ts": output.created_at.timestamp(),
+                }
+                event.trace.record("agent_tool_call", tool_name=info)
+                if streaming and show_tool_use:
+                    yield MessageChain(chain=[], type="break")
+                if event.get_platform_name() == "webchat":
+                    await event.send(
+                        MessageChain(type="tool_call", chain=[Json(data=info)])
+                    )
+                elif show_tool_use and not show_tool_call_result:
+                    await event.send(
+                        MessageChain(type="tool_call").message(
+                            f"🔨 调用工具: {payload.name}"
+                        )
+                    )
+            elif isinstance(payload, (ToolFinished, ToolRejected)):
+                if isinstance(payload, ToolFinished):
+                    name, call_id = names.pop(
+                        payload.execution_id, ("unknown", payload.call_id)
+                    )
+                else:
+                    name, call_id = payload.name, payload.call_id
+                text = "".join(
+                    part.text
+                    for part in payload.content
+                    if isinstance(part, PlainOutput)
                 )
-            else:
-                name, call_id = payload.name, payload.call_id
-            text = "".join(
-                part.text for part in payload.content if isinstance(part, PlainOutput)
-            )
-            if not text and payload.error:
-                text = payload.error.message
-            event.trace.record("agent_tool_result", tool_result=text)
-            if event.get_platform_name() == "webchat":
+                if not text and payload.error:
+                    text = payload.error.message
+                event.trace.record("agent_tool_result", tool_result=text)
+                if event.get_platform_name() == "webchat":
+                    await event.send(
+                        MessageChain(
+                            type="tool_call_result",
+                            chain=[
+                                Json(
+                                    data={
+                                        "id": call_id,
+                                        "result": text,
+                                        "ts": output.created_at.timestamp(),
+                                    }
+                                )
+                            ],
+                        )
+                    )
+                elif show_tool_use and show_tool_call_result:
+                    await event.send(
+                        MessageChain(type="tool_call").message(
+                            f"🔨 调用工具: {name}\n📎 返回结果: {_truncate_tool_result(text)}"
+                        )
+                    )
+            elif (
+                isinstance(payload, UsageUpdated)
+                and event.get_platform_name() == "webchat"
+            ):
+                tokens = payload.usage.tokens
+                metrics = payload.metrics
                 await event.send(
                     MessageChain(
-                        type="tool_call_result",
+                        type="agent_stats",
                         chain=[
                             Json(
                                 data={
-                                    "id": call_id,
-                                    "result": text,
-                                    "ts": output.created_at.timestamp(),
+                                    "token_usage": {
+                                        "input_other": tokens.input_tokens
+                                        - (tokens.cached_input_tokens or 0)
+                                        if tokens.input_tokens is not None
+                                        else None,
+                                        "input_cached": tokens.cached_input_tokens,
+                                        "output": tokens.output_tokens,
+                                    },
+                                    "current_context_tokens": payload.usage.context.tokens,
+                                    "duration": metrics.duration_ms / 1000
+                                    if metrics.duration_ms is not None
+                                    else None,
+                                    "time_to_first_token": metrics.first_token_ms / 1000
+                                    if metrics.first_token_ms is not None
+                                    else None,
                                 }
                             )
                         ],
                     )
                 )
-            elif show_tool_use and show_tool_call_result:
-                await event.send(
-                    MessageChain(type="tool_call").message(
-                        f"🔨 调用工具: {name}\n📎 返回结果: {_truncate_tool_result(text)}"
-                    )
-                )
-        elif (
-            isinstance(payload, UsageUpdated) and event.get_platform_name() == "webchat"
-        ):
-            tokens = payload.usage.tokens
-            metrics = payload.metrics
-            await event.send(
-                MessageChain(
-                    type="agent_stats",
-                    chain=[
-                        Json(
-                            data={
-                                "token_usage": {
-                                    "input_other": tokens.input_tokens
-                                    - (tokens.cached_input_tokens or 0)
-                                    if tokens.input_tokens is not None
-                                    else None,
-                                    "input_cached": tokens.cached_input_tokens,
-                                    "output": tokens.output_tokens,
-                                },
-                                "current_context_tokens": payload.usage.context.tokens,
-                                "duration": metrics.duration_ms / 1000
-                                if metrics.duration_ms is not None
-                                else None,
-                                "time_to_first_token": metrics.first_token_ms / 1000
-                                if metrics.first_token_ms is not None
-                                else None,
-                            }
-                        )
-                    ],
-                )
-            )
 
 
 async def deliver_agent_turn(context: Context, turn: AgentTurn) -> None:

@@ -555,6 +555,7 @@ async def test_slack_automatic_mention_through_response_pipeline(
         plugin_manager=SimpleNamespace(
             context=SimpleNamespace(
                 get_using_tts_provider_async=AsyncMock(return_value=None),
+                get_config=lambda **_: config,
             )
         ),
     )

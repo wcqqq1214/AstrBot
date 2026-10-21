@@ -1,6 +1,6 @@
 import asyncio
-from collections.abc import AsyncGenerator
-from contextlib import nullcontext
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing, nullcontext
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
@@ -22,6 +22,8 @@ from astrbot.api.message_components import (
     Reply,
 )
 from astrbot.api.platform import Group, MessageMember
+from astrbot.core.agent.events import RuntimeEvent
+from astrbot.core.agent.runtime import AgentTurn
 from astrbot.core.platform.button_interaction import encode_button_callback
 from astrbot.core.utils.media_utils import MediaResolver, file_uri_to_path
 
@@ -49,6 +51,39 @@ class SlackMessageEvent(AstrMessageEvent):
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.web_client = web_client
         self._stream: SlackMessageStream | None = None
+        self._agent_turn: AgentTurn | None = None
+        self._output_task: asyncio.Task | None = None
+        self._output_consumed = 0
+        self._output_changed = asyncio.Event()
+
+    def bind_agent_turn(self, turn: AgentTurn | None) -> None:
+        """Bind the streaming presenter before the independent runtime starts.
+
+        Args:
+            turn: Current runtime turn, or None when its pipeline exits.
+        """
+        self._agent_turn = turn
+        self._output_task = asyncio.current_task() if turn is not None else None
+        self._output_consumed = 0
+        self._output_changed.set()
+
+    async def iter_agent_output(self, turn: AgentTurn) -> AsyncIterator[RuntimeEvent]:
+        """Acknowledge runtime events only after the presenter consumes them.
+
+        Args:
+            turn: Runtime output being presented by this pipeline.
+
+        Yields:
+            Runtime events in their original order.
+        """
+        if self._agent_turn is turn:
+            self._output_task = asyncio.current_task()
+        async with aclosing(turn.events()) as outputs:
+            async for output in outputs:
+                yield output
+                if self._agent_turn is turn:
+                    self._output_consumed += 1
+                    self._output_changed.set()
 
     @staticmethod
     async def _from_segment_to_slack_block(
@@ -454,6 +489,22 @@ class SlackMessageEvent(AstrMessageEvent):
                 )
 
     async def send(self, message: MessageChain) -> None:
+        turn = self._agent_turn
+        if (
+            turn is not None
+            and asyncio.current_task() is not self._output_task
+            and (
+                self._stream is None or asyncio.current_task() is not self._stream.task
+            )
+        ):
+            # Execution is independent of presentation. Drain already-published
+            # text before sealing the stream, including sends before its first chunk.
+            boundary = turn.event_count
+            while self._output_consumed < boundary:
+                self._output_changed.clear()
+                if self._agent_turn is not turn:
+                    raise RuntimeError("Slack output presentation has ended")
+                await self._output_changed.wait()
         stream = self._stream
         # Stream-owned media already runs under the lock and seals its text first.
         external = stream is not None and asyncio.current_task() is not stream.task
