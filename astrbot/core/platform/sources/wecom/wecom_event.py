@@ -43,49 +43,34 @@ class WecomPlatformEvent(AstrMessageEvent):
     ) -> None:
         pass
 
-    async def split_plain(self, plain: str) -> list[str]:
-        """将长文本分割成多个小文本, 每个小文本长度不超过 2048 字符
+    async def split_plain(
+        self, plain: str, *, prefer_punctuation: bool = True
+    ) -> list[str]:
+        """Split text into chunks of at most 2048 UTF-8 bytes.
 
         Args:
-            plain (str): 要分割的长文本
-        Returns:
-            list[str]: 分割后的文本列表
+            plain: Text to split.
+            prefer_punctuation: Whether to prefer punctuation over filling each chunk.
 
+        Returns:
+            Text chunks that preserve the original content and character boundaries.
         """
-        if len(plain) <= 2048:
+        encoded = plain.encode("utf-8")
+        if len(encoded) <= 2048:
             return [plain]
         result = []
         start = 0
-        while start < len(plain):
-            # 剩下的字符串长度<2048时结束
-            if start + 2048 >= len(plain):
-                result.append(plain[start:])
-                break
+        while start < len(encoded):
+            # Ignore only a partial trailing character; its bytes remain for the next chunk.
+            chunk = encoded[start : start + 2048].decode("utf-8", errors="ignore")
+            if prefer_punctuation and start + 2048 < len(encoded):
+                for i in range(len(chunk), 0, -1):
+                    if chunk[i - 1] in "。！？.!?\n;；":
+                        chunk = chunk[:i]
+                        break
 
-            # 向前搜索分割标点符号
-            end = min(start + 2048, len(plain))
-            cut_position = end
-            for i in range(end, start, -1):
-                if i < len(plain) and plain[i - 1] in [
-                    "。",
-                    "！",
-                    "？",
-                    ".",
-                    "!",
-                    "?",
-                    "\n",
-                    ";",
-                    "；",
-                ]:
-                    cut_position = i
-                    break
-
-            # 没找到合适的位置分割, 直接切分
-            if cut_position == end and end < len(plain):
-                cut_position = end
-
-            result.append(plain[start:cut_position])
-            start = cut_position
+            result.append(chunk)
+            start += len(chunk.encode("utf-8"))
 
         return result
 
@@ -105,6 +90,11 @@ class WecomPlatformEvent(AstrMessageEvent):
                 if isinstance(comp, Plain):
                     # Split long text messages if needed
                     plain_chunks = await self.split_plain(comp.text)
+                    # WeChat customer service allows five replies per customer message.
+                    if len(plain_chunks) > 5:
+                        plain_chunks = await self.split_plain(
+                            comp.text, prefer_punctuation=False
+                        )
                     for chunk in plain_chunks:
                         try:
                             kf_message_api.send_text(user_id, self.get_self_id(), chunk)
