@@ -346,7 +346,10 @@ async def test_send_message_missing_image_path_stops_before_send(tmp_path, monke
         ],
     )
 
-    assert "error: failed to build messages[1] component: sandbox unavailable" in result
+    assert result.isError is True
+    assert result.content[0].text == (
+        "error: failed to build messages[1] component: sandbox unavailable"
+    )
     ctx.context.context.send_message.assert_not_called()
 
 
@@ -381,8 +384,11 @@ async def test_restricted_role_cannot_send_arbitrary_local_absolute_file(
         messages=[{"type": component_type, "path": str(secret_path)}],
     )
 
-    assert "error: Local file send is restricted for this user" in result
-    assert str(secret_path) in result
+    assert result.isError is True
+    assert (
+        "error: Local file send is restricted for this user" in result.content[0].text
+    )
+    assert str(secret_path) in result.content[0].text
     ctx.context.context.send_message.assert_not_called()
 
 

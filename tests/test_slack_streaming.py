@@ -1011,6 +1011,10 @@ async def _send_through_respond_stage(event, chunks):
         "send_lost",
         "send_missing_platform",
         "send_prepare_failed",
+        "send_image_missing",
+        "send_image_denied",
+        "send_image_error",
+        "send_image_no_source",
     ],
 )
 async def test_task_cards_through_real_tool_runner_and_respond(
@@ -1099,6 +1103,37 @@ async def test_task_cards_through_real_tool_runner_and_respond(
             return True
 
         config_holder.send_message = AsyncMock(side_effect=send_message)
+        if outcome.startswith("send_image_"):
+            from astrbot.core.astr_agent_runtime.tools import message_tools
+
+            path = tmp_path / "image.png"
+            tool_args = {"messages": [{"type": "image", "path": str(path)}]}
+            stream.event.role = "member"
+            config_holder.get_config = lambda **_: {
+                "provider_settings": {
+                    "computer_use_runtime": "sandbox"
+                    if outcome == "send_image_error"
+                    else "local",
+                    "computer_use_local_permissions": {
+                        "member": {"filesystem_scope": "none"}
+                    },
+                }
+            }
+            monkeypatch.setattr(
+                message_tools,
+                "workspace_root_for_context",
+                AsyncMock(return_value=tmp_path / "workspace"),
+            )
+            if outcome == "send_image_denied":
+                path.write_bytes(b"image fixture")
+            elif outcome == "send_image_error":
+                monkeypatch.setattr(
+                    message_tools,
+                    "get_booter",
+                    AsyncMock(side_effect=RuntimeError("sandbox unavailable")),
+                )
+            elif outcome == "send_image_no_source":
+                tool_args = {"messages": [{"type": "image"}]}
 
     if outcome.startswith(("shell_", "python_", "session_")):
         from astrbot.core.astr_agent_runtime.computer.booters.local import (
@@ -1393,16 +1428,19 @@ async def test_task_cards_through_real_tool_runner_and_respond(
             "send_lost": "image accepted but response lost",
             "send_missing_platform": "error: failed to find platform",
             "send_prepare_failed": "error: cannot submit message output",
+            "send_image_missing": "error: image path does not exist",
+            "send_image_denied": "error: Local file send is restricted for this user",
+            "send_image_error": "error: failed to build messages[0] component: sandbox unavailable",
+            "send_image_no_source": "error: messages[0] must include path or url for image component.",
         }[outcome]
         assert expected_text in str(results[0].content)
         assert calls == 2
-        assert config_holder.send_message.await_count == int(
-            outcome != "send_prepare_failed"
+        prepared = outcome != "send_prepare_failed" and not outcome.startswith(
+            "send_image_"
         )
+        assert config_holder.send_message.await_count == int(prepared)
         media = [i for i, (_, body) in enumerate(requests) if "blocks" in body]
-        assert len(media) == int(
-            outcome not in {"send_missing_platform", "send_prepare_failed"}
-        )
+        assert len(media) == int(prepared and outcome != "send_missing_platform")
         if media:
             before = next(
                 i

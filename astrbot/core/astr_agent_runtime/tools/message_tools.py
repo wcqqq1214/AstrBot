@@ -251,7 +251,9 @@ class SendMessageToUserTool(FunctionTool[AstrAgentContext]):
                     elif url:
                         components.append(Comp.Image.fromURL(url=url))
                     else:
-                        return f"error: messages[{idx}] must include path or url for image component."
+                        return execution_error_result(
+                            f"error: messages[{idx}] must include path or url for image component."
+                        )
                 elif msg_type == "record":
                     path = msg.get("path")
                     url = msg.get("url")
@@ -304,11 +306,13 @@ class SendMessageToUserTool(FunctionTool[AstrAgentContext]):
                         f"error: unsupported message type '{msg_type}' at index {idx}."
                     )
             except FileNotFoundError as exc:
-                return f"error: {exc}"
+                return execution_error_result(f"error: {exc}")
             except PermissionError as exc:
-                return f"error: {exc}"
+                return execution_error_result(f"error: {exc}")
             except Exception as exc:
-                return f"error: failed to build messages[{idx}] component: {exc}"
+                return execution_error_result(
+                    f"error: failed to build messages[{idx}] component: {exc}"
+                )
 
         try:
             target_session = (
