@@ -354,7 +354,8 @@ async def test_thread_image_delivery_loss_does_not_fall_back_to_channel(dispatch
     d.client.api_call.side_effect = TimeoutError("Delivery unknown")
     with event_context(d.event):
         result = await d.tool.call(d.wrapper, messages=d.messages)
-    assert result.startswith("error: failed to send message")
+    assert result.isError is True
+    assert result.content[0].text.startswith("error: failed to send message")
     d.client.api_call.assert_awaited_once()
     assert d.client.api_call.await_args.kwargs["json"]["thread_ts"] == "0.1"
     d.history.assert_not_awaited()

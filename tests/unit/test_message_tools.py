@@ -188,7 +188,8 @@ async def test_send_message_returns_platform_error_to_tool_result():
         messages=[{"type": "plain", "text": "hello"}],
     )
 
-    assert result == (
+    assert result.isError is True
+    assert result.content[0].text == (
         "error: failed to send message to session "
         "qq_official:GroupMessage:group-1: 413 Request Entity Too Large"
     )
@@ -204,7 +205,8 @@ async def test_send_message_missing_platform_does_not_record_delivery():
     result = await SendMessageToUserTool().call(
         ctx, messages=[{"type": "plain", "text": "hello"}]
     )
-    assert result.startswith("error: failed to find platform")
+    assert result.isError is True
+    assert result.content[0].text.startswith("error: failed to find platform")
     ctx.context.event.trace.record.assert_not_called()
     assert ctx.context.event._has_send_oper is False
 

@@ -1006,6 +1006,11 @@ async def _send_through_respond_stage(event, chunks):
         "direct_success",
         "direct_rejected",
         "direct_lost",
+        "send_success",
+        "send_rejected",
+        "send_lost",
+        "send_missing_platform",
+        "send_prepare_failed",
     ],
 )
 async def test_task_cards_through_real_tool_runner_and_respond(
@@ -1025,6 +1030,7 @@ async def test_task_cards_through_real_tool_runner_and_respond(
     succeeded = outcome in {
         "success",
         "direct_success",
+        "send_success",
         "shell_output",
         "python_output",
         "session_terminate",
@@ -1040,9 +1046,9 @@ async def test_task_cards_through_real_tool_runner_and_respond(
         if fallback and body.get("task_display_mode") == "plan":
             raise SlackApiError("unsupported cards", {"error": "invalid_arguments"})
         if "blocks" in body:
-            if outcome == "direct_rejected":
+            if outcome in {"direct_rejected", "send_rejected"}:
                 raise SlackApiError("image rejected", {"error": "channel_not_found"})
-            if outcome == "direct_lost":
+            if outcome in {"direct_lost", "send_lost"}:
                 raise TimeoutError("image accepted but response lost")
         return {"ok": True, "ts": body.get("ts", str(len(requests)))}
 
@@ -1075,6 +1081,25 @@ async def test_task_cards_through_real_tool_runner_and_respond(
     )
     tool_args = {}
     config_holder = SimpleNamespace()
+    if outcome.startswith("send_"):
+        from astrbot.core.astr_agent_runtime.tools.message_tools import (
+            SendMessageToUserTool,
+        )
+
+        tool = SendMessageToUserTool()
+        tool_args = {
+            "messages": [{"type": "image", "url": "https://example.com/tool.png"}]
+        }
+
+        async def send_message(target_session, chain):
+            assert str(target_session) == stream.event.unified_msg_origin
+            if outcome == "send_missing_platform":
+                return False
+            await stream.event.send(chain)
+            return True
+
+        config_holder.send_message = AsyncMock(side_effect=send_message)
+
     if outcome.startswith(("shell_", "python_", "session_")):
         from astrbot.core.astr_agent_runtime.computer.booters.local import (
             LocalPythonComponent,
@@ -1264,12 +1289,19 @@ async def test_task_cards_through_real_tool_runner_and_respond(
             yield LLMResponse(role="assistant", completion_text="Final")
 
     context = ContextWrapper(
-        context=SimpleNamespace(event=stream.event, context=config_holder)
+        context=SimpleNamespace(
+            event=stream.event,
+            context=config_holder,
+            _output_turn=None,
+            send_to_user=outcome != "send_prepare_failed",
+        )
     )
     context.tool_call_timeout = 0.02 if outcome == "timeout" else 5
     runner = ToolLoopAgentRunner()
     await runner.reset(
-        provider=SimpleNamespace(provider_config={}, text_chat_stream=model, get_model=lambda: "offline"),
+        provider=SimpleNamespace(
+            provider_config={}, text_chat_stream=model, get_model=lambda: "offline"
+        ),
         request=ProviderRequest(
             prompt="probe",
             func_tool=ToolSet(tools=[tool]),
@@ -1352,6 +1384,38 @@ async def test_task_cards_through_real_tool_runner_and_respond(
         assert len(results) == 1
         assert expected_file_text in str(results[0].content)
         assert calls == 2
+    if outcome.startswith("send_"):
+        results = [m for m in runner.run_context.messages if m.role == "tool"]
+        assert len(results) == 1
+        expected_text = {
+            "send_success": "Message sent to session",
+            "send_rejected": "channel_not_found",
+            "send_lost": "image accepted but response lost",
+            "send_missing_platform": "error: failed to find platform",
+            "send_prepare_failed": "error: cannot submit message output",
+        }[outcome]
+        assert expected_text in str(results[0].content)
+        assert calls == 2
+        assert config_holder.send_message.await_count == int(
+            outcome != "send_prepare_failed"
+        )
+        media = [i for i, (_, body) in enumerate(requests) if "blocks" in body]
+        assert len(media) == int(
+            outcome not in {"send_missing_platform", "send_prepare_failed"}
+        )
+        if media:
+            before = next(
+                i
+                for i, (_, body) in enumerate(requests)
+                if body.get("markdown_text") == "Before"
+            )
+            final = next(
+                i
+                for i, (_, body) in enumerate(requests)
+                if body.get("markdown_text") == "Final"
+            )
+            assert before < media[0] < final
+            assert requests[media[0]][1]["thread_ts"] == "0.1"
     if outcome.startswith("direct_"):
         assert calls == 1  # Direct delivery still ends the loop, even on failure.
         assert sum("blocks" in body for _, body in requests) == 1

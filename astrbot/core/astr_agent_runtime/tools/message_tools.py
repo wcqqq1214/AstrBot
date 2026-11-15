@@ -18,6 +18,7 @@ from astrbot.core.astr_agent_runtime.context import AstrAgentContext
 from astrbot.core.astr_agent_runtime.tools.computer_tools.fs import _remote_basename
 from astrbot.core.astr_agent_runtime.tools.computer_tools.util import (
     check_admin_permission,
+    execution_error_result,
     get_local_permission_policy,
     is_local_runtime,
     workspace_root,
@@ -343,7 +344,7 @@ class SendMessageToUserTool(FunctionTool[AstrAgentContext]):
                 context.context, message_chain, target_umo=str(target_session)
             )
         except (RuntimeError, ValueError) as exc:
-            return f"error: cannot submit message output: {exc}"
+            return execution_error_result(f"error: cannot submit message output: {exc}")
         if not send_to_user:
             return (
                 f"Message prepared for session {target_session} and handed to the "
@@ -355,9 +356,13 @@ class SendMessageToUserTool(FunctionTool[AstrAgentContext]):
                 message_chain,
             )
         except Exception as exc:
-            return f"error: failed to send message to session {target_session}: {exc}"
+            return execution_error_result(
+                f"error: failed to send message to session {target_session}: {exc}"
+            )
         if not sent:
-            return f"error: failed to find platform for session {target_session}."
+            return execution_error_result(
+                f"error: failed to find platform for session {target_session}."
+            )
         if str(target_session) == current_session:
             context.context.event._has_send_oper = True
             sent_plain_text = message_chain.get_plain_text().strip()
