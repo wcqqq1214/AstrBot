@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
+import { reactive } from "vue";
 
 const source = readFileSync(
   new URL("../src/composables/useMessages.ts", import.meta.url),
@@ -18,6 +19,11 @@ const names = new Set([
   "startSseStream",
   "processStreamPayload",
   "isSessionRunning",
+  "appendPlain",
+  "hasPlainText",
+  "markMessageStarted",
+  "messageContent",
+  "payloadText",
 ]);
 const functions = [];
 const visit = (node) => {
@@ -35,6 +41,7 @@ for (const scenario of ["missing end", "complete", "aborted", "another run"]) {
     const connections = {};
     const reloads = [];
     const context = vm.createContext({
+      exports: {},
       AbortController,
       activeConnections: connections,
       messagesBySession: { session: [bot] },
@@ -50,7 +57,6 @@ for (const scenario of ["missing end", "complete", "aborted", "another run"]) {
           connections.other = { sessionId: "session" };
         }
       },
-      markMessageStarted: () => {},
       partToPayload: (part) => part,
       loadSessionMessages: async (...args) => reloads.push(args),
       options: { onSessionsChanged: async () => {} },
@@ -75,3 +81,27 @@ for (const scenario of ["missing end", "complete", "aborted", "another run"]) {
     );
   });
 }
+
+test("an image keeps its place before text completed while the image is loading", async () => {
+  const context = vm.createContext({
+    exports: {},
+    reactive,
+    resolvePartMedia: async () => {},
+  });
+  vm.runInContext(ts.transpile(functions.join("\n")), context);
+  for (const streamedPrefix of ["", "Sent "]) {
+    const bot = { content: { type: "bot", message: [] } };
+    const send = (type, data) =>
+      context.processStreamPayload(bot, { type, data, streaming: true });
+    send("image", "[IMAGE]photo.png");
+    send("complete", "");
+    if (streamedPrefix) send("plain", streamedPrefix);
+    send("complete", "Sent [IMAGE]photo.png");
+    send("end", "");
+    await new Promise(setImmediate);
+    assert.deepEqual(JSON.parse(JSON.stringify(bot.content.message)), [
+      { type: "image", filename: "photo.png" },
+      { type: "plain", text: "Sent [IMAGE]photo.png" },
+    ]);
+  }
+});

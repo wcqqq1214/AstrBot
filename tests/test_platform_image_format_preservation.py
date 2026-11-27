@@ -67,12 +67,17 @@ async def test_webchat_image_attachment_uses_detected_extension(tmp_path, monkey
         "message-1",
         MessageChain([Image(file=image_ref)]),
         "webchat!user!conversation-1",
+        streaming=True,
+        emit_complete=True,
     )
 
     payload = await queue.get()
+    assert payload["type"] == "image"
     filename = payload["data"].removeprefix("[IMAGE]")
     assert filename.endswith(".png")
     assert (tmp_path / filename).exists()
+    complete = queue.get_nowait()
+    assert (complete["type"], complete["data"]) == ("complete", "")
 
 
 @pytest.mark.asyncio

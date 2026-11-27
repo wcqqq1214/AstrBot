@@ -1456,17 +1456,12 @@ export function useMessages(options: UseMessagesOptions) {
           ? rawFilename.slice(separatorIndex + 1)
           : storedFilename;
       const filename = displayFilename || storedFilename;
-      const mediaPart: MessagePart = { type: msgType, filename };
+      const mediaPart = reactive<MessagePart>({ type: msgType, filename });
       if (storedFilename && storedFilename !== filename) {
         mediaPart.stored_filename = storedFilename;
       }
-      if (msgType !== "file") {
-        resolvePartMedia(mediaPart).then(() => {
-          messageContent(botRecord).message.push(mediaPart);
-        });
-      } else {
-        messageContent(botRecord).message.push(mediaPart);
-      }
+      messageContent(botRecord).message.push(mediaPart);
+      if (msgType !== "file") void resolvePartMedia(mediaPart);
     }
   }
 

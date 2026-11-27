@@ -60,15 +60,15 @@ class WebChatMessageEvent(AstrMessageEvent):
             )
             return
 
-        data = ""
+        final_text = ""
         for comp in message.chain:
             if isinstance(comp, Plain):
-                data = comp.text
+                final_text += comp.text
                 accepted = await webchat_queue_mgr.put_back_queue(
                     request_id,
                     {
                         "type": "plain",
-                        "data": data,
+                        "data": comp.text,
                         "streaming": streaming,
                         "chain_type": message.type,
                         "message_id": message_id,
@@ -82,12 +82,12 @@ class WebChatMessageEvent(AstrMessageEvent):
                 )
                 part_type = part.pop("type")
                 if part_type == "plain":
-                    data = part["text"]
+                    final_text += part["text"]
                 accepted = await webchat_queue_mgr.put_back_queue(
                     request_id,
                     {
                         "type": part_type,
-                        "data": part if part_type == "view" else data,
+                        "data": part if part_type == "view" else part["text"],
                         "streaming": streaming,
                         "message_id": message_id,
                     },
@@ -151,12 +151,11 @@ class WebChatMessageEvent(AstrMessageEvent):
                 filename = f"{generate_timestamp_id()}{suffix}"
                 path = os.path.join(attachments_dir, filename)
                 await asyncio.to_thread(Path(path).write_bytes, image_bytes)
-                data = f"[IMAGE]{filename}"
                 accepted = await webchat_queue_mgr.put_back_queue(
                     request_id,
                     {
                         "type": "image",
-                        "data": data,
+                        "data": f"[IMAGE]{filename}",
                         "streaming": streaming,
                         "message_id": message_id,
                     },
@@ -175,12 +174,11 @@ class WebChatMessageEvent(AstrMessageEvent):
                 filename = f"{generate_timestamp_id()}{suffix}"
                 path = os.path.join(attachments_dir, filename)
                 await asyncio.to_thread(Path(path).write_bytes, record_bytes)
-                data = f"[RECORD]{filename}"
                 accepted = await webchat_queue_mgr.put_back_queue(
                     request_id,
                     {
                         "type": "record",
-                        "data": data,
+                        "data": f"[RECORD]{filename}",
                         "streaming": streaming,
                         "message_id": message_id,
                     },
@@ -202,12 +200,11 @@ class WebChatMessageEvent(AstrMessageEvent):
                 filename = f"{generate_timestamp_id()}{ext}"
                 dest_path = os.path.join(attachments_dir, filename)
                 shutil.copy2(file_path, dest_path)
-                data = f"[FILE]{filename}|{original_name}"
                 accepted = await webchat_queue_mgr.put_back_queue(
                     request_id,
                     {
                         "type": "file",
-                        "data": data,
+                        "data": f"[FILE]{filename}|{original_name}",
                         "streaming": streaming,
                         "message_id": message_id,
                     },
@@ -222,14 +219,14 @@ class WebChatMessageEvent(AstrMessageEvent):
                 request_id,
                 {
                     "type": "complete",
-                    "data": data,
+                    "data": final_text,
                     "streaming": streaming,
                     "chain_type": message.type,
                     "message_id": message_id,
                 },
             )
 
-        return data
+        return final_text
 
     async def send(self, message: MessageChain | None) -> None:
         message_id = self.message_obj.message_id
